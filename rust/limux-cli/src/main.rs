@@ -717,6 +717,161 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Agent hooks (claude-hook / opencode-hook / gemini-hook)
+// ---------------------------------------------------------------------------
+//
+// These subcommands read a JSON hook event from stdin and translate it into
+// a `notify` (and, eventually, log / progress) call so the GUI reflects
+// agent activity in real time. Designed for direct wiring into Claude Code,
+// OpenCode, and Gemini CLI's hook settings.
+//
+// Claude Code stdin schema (what we rely on):
+//   {
+//     "session_id": "...",
+//     "transcript_path": "...",
+//     "cwd": "...",
+//     "hook_event_name": "Notification" | "Stop" | "SessionStart" | ...,
+//     "message": "agent is waiting for input",     // Notification only
+//     "tool_name": "...", "tool_input": {...},     // PreToolUse/PostToolUse
+//     "tool_response": {...},                       // PostToolUse
+//     "prompt": "..."                               // UserPromptSubmit
+//   }
+//
+// OpenCode and Gemini use slightly different names; we fall back gracefully
+// when fields are missing.
+
+#[derive(Clone, Copy, Debug)]
+enum AgentKind {
+    Claude,
+    OpenCode,
+    Gemini,
+}
+
+impl AgentKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+        }
+    }
+}
+
+/// Pull a string field from the hook JSON, trying multiple keys.
+fn hook_str<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| payload.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Run an agent hook: read JSON from stdin, synthesize a notification.
+///
+/// Args:
+///   [event_name] — optional positional, e.g. "Notification", "Stop".
+///                  If omitted, we read `hook_event_name` from the JSON.
+async fn run_agent_hook(client: &mut Client, agent: AgentKind, args: &[String]) -> Result<Value> {
+    use std::io::Read;
+
+    // Read stdin (hook JSON). If stdin is empty or not JSON, treat as
+    // minimal event so we still post *something*.
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let raw = raw.trim();
+    let payload: Value = if raw.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
+    };
+
+    // Explicit event positional beats the JSON field.
+    let event = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .or_else(|| hook_str(&payload, &["hook_event_name", "event"]).map(str::to_owned))
+        .unwrap_or_else(|| "event".to_string());
+
+    // Build a human-friendly title + body depending on event + agent.
+    let agent_label = agent.label();
+    let (title, body) = match event.as_str() {
+        "Notification" => (
+            format!("{agent_label} needs you"),
+            hook_str(&payload, &["message", "notification"])
+                .unwrap_or("waiting for input")
+                .to_owned(),
+        ),
+        "Stop" | "SubagentStop" => (
+            format!("{agent_label} finished"),
+            hook_str(&payload, &["message", "reason"])
+                .unwrap_or("task complete")
+                .to_owned(),
+        ),
+        "SessionStart" => (
+            format!("{agent_label} session started"),
+            hook_str(&payload, &["cwd", "source"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        "SessionEnd" => (
+            format!("{agent_label} session ended"),
+            hook_str(&payload, &["reason"]).unwrap_or("").to_owned(),
+        ),
+        "PreToolUse" | "PostToolUse" => (
+            format!(
+                "{agent_label}: {}",
+                hook_str(&payload, &["tool_name"]).unwrap_or("tool")
+            ),
+            hook_str(&payload, &["tool_input", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        "UserPromptSubmit" => (
+            format!("{agent_label}: new prompt"),
+            hook_str(&payload, &["prompt"])
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect(),
+        ),
+        other => (
+            format!("{agent_label}: {other}"),
+            hook_str(&payload, &["message", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+    };
+
+    let subtitle = hook_str(&payload, &["session_id"])
+        .map(|s| {
+            // Show only a short prefix of the session id to keep sidebar tidy.
+            s.chars().take(8).collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty());
+
+    let mut params = Map::new();
+    params.insert("title".to_string(), Value::String(title));
+    if !subtitle.is_empty() {
+        params.insert("subtitle".to_string(), Value::String(subtitle));
+    }
+    if !body.is_empty() {
+        params.insert("body".to_string(), Value::String(body));
+    }
+
+    call_in_workspace_scope(
+        client,
+        workspace,
+        "notification.create",
+        Value::Object(params),
+    )
+    .await
+}
+
 async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     let cwd = parse_opt(args, "--cwd");
     let command = parse_opt(args, "--command");
@@ -1795,6 +1950,20 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "notify" => {
             let payload = run_notify(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "claude-hook" | "opencode-hook" | "gemini-hook" => {
+            let agent = match command {
+                "claude-hook" => AgentKind::Claude,
+                "opencode-hook" => AgentKind::OpenCode,
+                "gemini-hook" => AgentKind::Gemini,
+                _ => unreachable!(),
+            };
+            let payload = run_agent_hook(client, agent, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
