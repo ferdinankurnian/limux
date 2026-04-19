@@ -42,19 +42,33 @@ This unblocks `list-panes`, `pane.surfaces`, `surface.list`,
 everything needed for agents to discover each other and read each
 other's screens.
 
-### Phase 3 — `limux notify` + GUI toast/sidebar integration
-Wire a new `ControlCommand::CreateNotification` variant in the bridge,
-plumb into `mark_workspace_unread_with_message` + libadwaita toast.
-Add CLI subcommand.
+### Phase 3 — `limux notify` + GUI toast/sidebar integration ✅
+`ControlCommand::CreateNotification` wired through the bridge into
+`mark_workspace_unread_with_message` + libadwaita toast.
+CLI: `limux notify [--workspace <id|name>] [--subtitle <…>] [--body <…>] <title>`.
 
-### Phase 4 — `limux claude-hook` / `opencode-hook` / `gemini-hook`
-Read hook JSON from stdin, translate to `notify`/`send`. Provides a one-line
-install into `~/.claude/settings.json`.
+### Phase 4 — `limux claude-hook` / `opencode-hook` / `gemini-hook` ✅
+Reads hook JSON from stdin, translates the agent-specific event vocabulary
+into a `notify` (and, where useful, an inline `send`). Drop-in for
+`~/.claude/settings.json` hooks blocks.
 
-### Phase 5 — `limux agent-team` + `AGENTS.md` template
-Spawns N agent surfaces, captures their surface IDs, writes
-`./AGENTS.md` with the XML message protocol and the surface-id table,
-launches each agent with the seed prompt.
+### Phase 5 — `limux agent-team` + `AGENTS.md` template ✅
+`limux agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>]
+[--no-launch] [--dry-run]`:
+
+- Calls `workspace.create` once per agent with `name=<agent>`, `cwd=<shared>`,
+  `command=<agent CLI>` so each workspace launches the agent automatically.
+- Bridge now passes `allow_name=true` to `parse_optional_workspace_target`
+  for `surface.send_text` and `notification.create`, so peers address each
+  other by workspace name (`limux send --workspace claude …`) instead of
+  needing to swap UUIDs.
+- Writes `AGENTS.md` in the shared cwd documenting:
+    - the peers table (agent → workspace name → workspace ID → launch cmd),
+    - the `<agent-msg from="…" to="…" id="…" reply-to="…" ts="…">` envelope,
+    - the exact `limux send` invocation for sending and replying,
+    - the `limux notify` escalation path for human input,
+    - the `LIMUX_*` env contract every spawned terminal inherits,
+    - editable Policies section (timeouts, size limits, destructive-action gating).
 
 ### Phase 6 — (deferred) `limux progress`, `limux log`, `limux markdown`
 Nice polish, not blockers.

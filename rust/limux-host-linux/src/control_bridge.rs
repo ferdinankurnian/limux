@@ -320,7 +320,9 @@ fn handle_method(
                     BridgeError::invalid_params("surface.send_text requires text"),
                 );
             };
-            let target = match parse_optional_workspace_target(params, false) {
+            // allow_name = true: lets agent-team peers address each other by
+            // workspace name (e.g. `--workspace codex`) instead of UUID.
+            let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
@@ -347,7 +349,8 @@ fn handle_method(
             };
             let subtitle = optional_string(params, &["subtitle"]).unwrap_or_default();
             let body = optional_string(params, &["body", "message"]).unwrap_or_default();
-            let target = match parse_optional_workspace_target(params, false) {
+            // allow_name = true: lets agent hooks target a peer by name.
+            let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };

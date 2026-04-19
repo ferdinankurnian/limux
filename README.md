@@ -105,6 +105,34 @@ Run the canonical local quality gate before committing:
 
 Repository maintainability rules live in [`docs/maintainability.md`](docs/maintainability.md).
 
+## Agent integrations
+
+Limux ships first-class hooks for coding agents (Codex, Claude Code,
+OpenCode, Gemini CLI). Every terminal limux spawns auto-exports
+`LIMUX_WORKSPACE_ID` / `LIMUX_SURFACE_ID` / `LIMUX_PANE_ID` /
+`LIMUX_TAB_ID` / `LIMUX_SOCKET`, so the CLI auto-targets the right place
+with no flags needed from inside the agent's own terminal.
+
+```bash
+# Fire a libadwaita toast + sidebar unread badge from any agent
+limux notify --subtitle "needs review" --body "blocked on auth choice" "Input needed"
+
+# Drop-in hook handlers — translate hook JSON on stdin into notify/send
+echo '{"event":"stop"}' | limux claude-hook --event stop
+echo '{"event":"tool_use","tool":"bash"}' | limux opencode-hook --event tool_use
+echo '{"event":"finished"}' | limux gemini-hook --event finished
+
+# Spin up a multi-agent collaboration team — one workspace per agent,
+# launches each agent's CLI, and writes AGENTS.md describing the
+# <agent-msg> XML protocol so peers can talk to each other:
+limux agent-team --agents codex,claude --cwd "$PWD"
+# → Codex and Claude can now do:
+#   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
+```
+
+See the auto-generated `AGENTS.md` for the full protocol spec, peer
+table, and editable Policies section.
+
 ## Keyboard shortcuts
 
 Most default shortcuts use `Ctrl`. Fullscreen defaults to `F11`. Custom remaps may also use `Cmd`, which Limux maps to either the Linux `Meta` or `Super` modifier. `Opt` maps to `Alt`.
