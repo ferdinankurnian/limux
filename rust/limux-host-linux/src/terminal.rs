@@ -816,6 +816,24 @@ pub struct TerminalCallbacks {
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
+    /// Extra environment variables to expose to the spawned shell
+    /// (e.g. `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, `LIMUX_PANE_ID`, `LIMUX_SOCKET`).
+    ///
+    /// These are resolved at pane-creation time so scripts running inside the
+    /// terminal can discover their own workspace/surface/pane without having
+    /// to call `limux identify` first. This is the foundation for the cmux
+    /// agent-to-agent communication workflow.
+    pub extra_env: Vec<(String, String)>,
+}
+
+impl Default for TerminalOptions {
+    fn default() -> Self {
+        Self {
+            hover_focus: Rc::new(|| false),
+            saved_font_size: None,
+            extra_env: Vec::new(),
+        }
+    }
 }
 
 /// Default font-size from ghostty config (cached on first access).
@@ -848,6 +866,7 @@ pub fn create_terminal(
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
     let hover_focus = options.hover_focus;
+    let extra_env = options.extra_env;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
@@ -947,6 +966,7 @@ pub fn create_terminal(
         let callbacks = callbacks.clone();
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
+        let extra_env = extra_env.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
@@ -983,6 +1003,29 @@ pub fn create_terminal(
             let c_wd = wd.as_ref().and_then(|s| CString::new(s.as_str()).ok());
             if let Some(ref cwd) = c_wd {
                 config.working_directory = cwd.as_ptr();
+            }
+
+            // Build env_vars array for the spawned shell. Keep the CStrings
+            // and the ghostty_env_var_s array alive until after
+            // ghostty_surface_new returns — Ghostty dupes the strings into
+            // its own arena (see ghostty/src/apprt/embedded.zig:573), so we
+            // only need the pointers valid across that single call.
+            let mut env_cstrings: Vec<(CString, CString)> = Vec::with_capacity(extra_env.len());
+            for (k, v) in extra_env.iter() {
+                if let (Ok(k_c), Ok(v_c)) = (CString::new(k.as_str()), CString::new(v.as_str())) {
+                    env_cstrings.push((k_c, v_c));
+                }
+            }
+            let mut env_vars_raw: Vec<ghostty_env_var_s> = env_cstrings
+                .iter()
+                .map(|(k, v)| ghostty_env_var_s {
+                    key: k.as_ptr(),
+                    value: v.as_ptr(),
+                })
+                .collect();
+            if !env_vars_raw.is_empty() {
+                config.env_vars = env_vars_raw.as_mut_ptr();
+                config.env_var_count = env_vars_raw.len();
             }
 
             let surface = unsafe { ghostty_surface_new(app, &config) };

@@ -168,6 +168,10 @@ type PaneShortcutCaptureCallback =
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 type PaneConfigCallback = dyn Fn() -> Rc<RefCell<AppConfig>>;
 type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
+/// Returns the workspace id that owns a given pane widget, or `None` if the
+/// pane is not yet attached to a workspace. Used to stamp `LIMUX_WORKSPACE_ID`
+/// onto every terminal spawned inside the pane.
+type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
 
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
@@ -184,6 +188,9 @@ pub struct PaneCallbacks {
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
     pub on_config_changed: Rc<PaneConfigChangedCallback>,
+    /// Resolve the workspace id for a given pane widget. May be `None` while
+    /// the pane is still being constructed; callers treat that as "unknown".
+    pub workspace_for_pane: Box<PaneWorkspaceLookupCallback>,
 }
 
 #[derive(Clone)]
@@ -1062,11 +1069,34 @@ fn add_terminal_tab_inner(
         })
     };
 
+    // Build the env the spawned shell will see. Encodes this terminal's
+    // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
+    // the current surface without flags. Mirrors cmux's env auto-wiring.
+    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+    let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
+    let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if let Some(ws) = workspace_id_for_env {
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
+    }
+    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
+    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
+    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
+    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
+        None,
+        limux_control::socket_path::SocketMode::Runtime,
+    )
+    .to_str()
+    {
+        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+    }
+
     let term = terminal::create_terminal(
         working_directory,
         terminal::TerminalOptions {
             hover_focus,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            extra_env,
         },
         term_callbacks,
     );

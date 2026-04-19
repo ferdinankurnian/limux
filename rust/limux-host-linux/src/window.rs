@@ -3169,6 +3169,7 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_config = state.clone();
     let state_for_config_changed = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
+    let ws_id_for_env = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -3281,6 +3282,7 @@ pub(crate) fn create_pane_for_workspace(
                 }
             },
         ),
+        workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
     });
 
     pane::create_pane(
