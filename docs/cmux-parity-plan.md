@@ -24,9 +24,9 @@ the Codex↔Claude workflow.
 
 ### Phase 1 — Env auto-wiring ✅ (shipped in 1295d12)
 
-### Phase 2 — Make the bridge a full proxy (CRITICAL)
+### Phase 2 — Make the bridge a full proxy (🚧 PARTIAL — still the critical path)
 
-The bridge should route unknown methods to a local `Dispatcher` instance
+Bridge should route unknown methods to a local `Dispatcher` instance
 seeded with live GTK state, OR to dedicated per-method `ControlCommand`
 variants that interrogate the live state. The cleanest path:
 
@@ -37,10 +37,28 @@ variants that interrogate the live state. The cleanest path:
 - Specific methods that need GTK side-effects (send_text, create_surface,
   notification.create) remain as `ControlCommand` variants.
 
-This unblocks `list-panes`, `pane.surfaces`, `surface.list`,
+Remaining work unblocks `list-panes`, `pane.surfaces`, `surface.list`,
 `surface.read_text`, `surface.send_key` against the live GUI — i.e.
-everything needed for agents to discover each other and read each
-other's screens.
+everything needed for agents to discover each other and **read each
+other's screens**.
+
+**Shipped so far (in 6b8eb1a, alongside phase 5):**
+
+- `surface.send_text` and `notification.create` now pass `allow_name=true`
+  to `parse_optional_workspace_target`, so peers can address each other
+  by workspace name (`--workspace claude`) without juggling runtime
+  UUIDs. This is what made phase 5 practical.
+
+**Still open (priority order):**
+
+- `pane.list` / `pane.surfaces` — agents enumerating the team
+- `surface.list` — agent discovery and peer sanity checks
+- `surface.read_text` — letting an agent read a peer's scrollback /
+  current output (biggest unlock for real Codex↔Claude review loops)
+- `surface.send_key` — key-level injection (arrow keys, Ctrl-C, etc.)
+
+These are the last blockers before Codex can ask Claude "what's on your
+screen?" programmatically — everything else on the roadmap is polish.
 
 ### Phase 3 — `limux notify` + GUI toast/sidebar integration ✅
 `ControlCommand::CreateNotification` wired through the bridge into

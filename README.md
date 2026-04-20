@@ -130,8 +130,13 @@ limux agent-team --agents codex,claude --cwd "$PWD"
 #   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
 ```
 
-See the auto-generated `AGENTS.md` for the full protocol spec, peer
-table, and editable Policies section.
+See the auto-generated `AGENTS.md` (written into the shared cwd) for
+the full protocol spec, peer table, and editable Policies section.
+
+Coding agents working on **limux itself** should read [`AGENTS.md`](AGENTS.md)
+and [`CLAUDE.md`](CLAUDE.md) in the repo root — those cover the build
+loop, crate map, and the `feat/cmux-parity` roadmap tracked in
+[`docs/cmux-parity-plan.md`](docs/cmux-parity-plan.md).
 
 ## Keyboard shortcuts
 
