@@ -96,6 +96,10 @@ fn workspace_ref(id: &str) -> String {
     format!("workspace:{id}")
 }
 
+fn pane_ref(id: u32) -> String {
+    format!("pane:{id}")
+}
+
 fn surface_ref(id: &str) -> String {
     format!("surface:{id}")
 }
@@ -104,6 +108,16 @@ fn normalize_workspace_handle(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("workspace:")
         .unwrap_or_else(|| raw.trim())
+}
+
+fn normalize_pane_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("pane:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn parse_pane_handle(raw: &str) -> Option<u32> {
+    normalize_pane_handle(raw).parse::<u32>().ok()
 }
 
 fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Option<usize> {
@@ -149,6 +163,185 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
     }))
+}
+
+fn focused_surface_payload(state: &State) -> Option<serde_json::Value> {
+    let (workspace_id, workspace_name, pane_widget) = {
+        let app_state = state.borrow();
+        let workspace = app_state.active_workspace()?;
+        let pane_widget = find_focused_pane(state).map(|(_, pane_widget)| pane_widget)?;
+        (workspace.id.clone(), workspace.name.clone(), pane_widget)
+    };
+    let surface = pane::active_surface_summary(&pane_widget)?;
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "workspace_id".to_string(),
+        serde_json::Value::String(workspace_id.clone()),
+    );
+    payload.insert(
+        "workspace_ref".to_string(),
+        serde_json::Value::String(workspace_ref(&workspace_id)),
+    );
+    payload.insert(
+        "title".to_string(),
+        serde_json::Value::String(workspace_name.clone()),
+    );
+    payload.insert(
+        "name".to_string(),
+        serde_json::Value::String(workspace_name),
+    );
+    payload.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(surface.pane_id.to_string()),
+    );
+    payload.insert(
+        "pane_ref".to_string(),
+        serde_json::Value::String(pane_ref(surface.pane_id)),
+    );
+    payload.insert(
+        "surface_id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    payload.insert(
+        "surface_ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    if !surface.title.is_empty() {
+        payload.insert(
+            "surface_title".to_string(),
+            serde_json::Value::String(surface.title),
+        );
+    }
+    payload.insert(
+        "surface_type".to_string(),
+        serde_json::Value::String(surface.kind),
+    );
+    if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+        payload.insert("cwd".to_string(), serde_json::Value::String(cwd));
+    }
+    if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+        payload.insert("uri".to_string(), serde_json::Value::String(uri));
+    }
+    Some(serde_json::Value::Object(payload))
+}
+
+fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>, Option<String>) {
+    let is_active = {
+        let app_state = state.borrow();
+        app_state
+            .active_workspace()
+            .map(|workspace| workspace.id == workspace_id)
+            .unwrap_or(false)
+    };
+    if !is_active {
+        return (None, None);
+    }
+
+    let Some((_focused_workspace_id, pane_widget)) = find_focused_pane(state) else {
+        return (None, None);
+    };
+    let Some(surface) = pane::active_surface_summary(&pane_widget) else {
+        return (None, None);
+    };
+    (Some(surface.pane_id), Some(surface.surface_id))
+}
+
+fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value {
+    let (focused_pane_id, _) = focused_ids_for_workspace(state, &workspace.id);
+    let panes = pane::pane_summaries_for_root(&workspace.root)
+        .into_iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(pane.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(pane.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "surface_count".to_string(),
+                serde_json::json!(pane.surface_count),
+            );
+            let focused = focused_pane_id == Some(pane.pane_id);
+            row.insert("focused".to_string(), serde_json::Value::Bool(focused));
+            row.insert("selected".to_string(), serde_json::Value::Bool(focused));
+            if let Some(surface_id) = pane.active_surface_id {
+                row.insert(
+                    "surface_id".to_string(),
+                    serde_json::Value::String(surface_id.clone()),
+                );
+                row.insert(
+                    "surface_ref".to_string(),
+                    serde_json::Value::String(surface_ref(&surface_id)),
+                );
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "panes": panes })
+}
+
+fn surface_list_payload(
+    state: &State,
+    workspace: &Workspace,
+    pane_filter: Option<u32>,
+) -> serde_json::Value {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .filter(|surface| pane_filter.is_none_or(|pane_id| surface.pane_id == pane_id))
+        .enumerate()
+        .map(|(index, surface)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "surface_id".to_string(),
+                serde_json::Value::String(surface.surface_id.clone()),
+            );
+            row.insert(
+                "surface_ref".to_string(),
+                serde_json::Value::String(surface_ref(&surface.surface_id)),
+            );
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(surface.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(surface.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "title".to_string(),
+                serde_json::Value::String(surface.title.clone()),
+            );
+            row.insert(
+                "type".to_string(),
+                serde_json::Value::String(surface.kind.clone()),
+            );
+            row.insert(
+                "selected".to_string(),
+                serde_json::Value::Bool(surface.selected),
+            );
+            row.insert(
+                "focused".to_string(),
+                serde_json::Value::Bool(
+                    focused_surface_id.as_deref() == Some(surface.surface_id.as_str()),
+                ),
+            );
+            if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+                row.insert("cwd".to_string(), serde_json::Value::String(cwd));
+            }
+            if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+                row.insert("uri".to_string(), serde_json::Value::String(uri));
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "surfaces": surfaces })
 }
 
 #[derive(Clone)]
@@ -2842,17 +3035,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     match command {
         ControlCommand::Identify { caller, reply } => {
             let result = {
-                let app_state = state.borrow();
-                let focused = workspace_payload(&app_state, app_state.active_idx)
-                    .map(|payload| {
-                        serde_json::json!({
-                            "workspace_id": payload["workspace_id"],
-                            "workspace_ref": payload["workspace_ref"],
-                            "title": payload["title"],
-                            "name": payload["name"],
-                        })
-                    })
-                    .unwrap_or(serde_json::Value::Null);
+                let focused = focused_surface_payload(state).unwrap_or(serde_json::Value::Null);
                 serde_json::json!({
                     "name": "limux-control",
                     "protocol": "v1+v2",
@@ -2883,6 +3066,90 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::ListPanes { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                pane_list_payload(state, &app_state.workspaces[index])
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::ListPaneSurfaces {
+            target,
+            pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let pane_filter = pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| pane_id.as_deref().and_then(|raw| raw.parse::<u32>().ok()));
+            if pane_id.is_some() && pane_filter.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.surfaces requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], pane_filter)
+            };
+
+            if pane_id.is_some()
+                && result["surfaces"]
+                    .as_array()
+                    .is_some_and(|surfaces| surfaces.is_empty())
+            {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found",
+                )));
+                return;
+            }
+
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::ListSurfaces { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], None)
+            };
+            let _ = reply.send(Ok(result));
         }
         ControlCommand::CreateWorkspace {
             name,
@@ -3056,7 +3323,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let target = {
                 let app_state = state.borrow();
                 let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_surface(&workspace.root, surface_hint.as_deref()).map(
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
                     |(surface_id, handle)| {
                         (
                             serde_json::json!({
@@ -3079,6 +3346,60 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             handle.send_text(&text);
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::SendKey {
+            target,
+            surface_hint,
+            key,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            if !handle.send_key(&key) {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "unsupported key",
+                )));
+                return;
+            }
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }

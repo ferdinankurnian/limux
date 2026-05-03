@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
+use crate::shortcut_config::NormalizedShortcut;
+
 // ---------------------------------------------------------------------------
 // Global Ghostty app singleton
 // ---------------------------------------------------------------------------
@@ -179,6 +181,42 @@ impl TerminalHandle {
                 ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
             }
         }
+    }
+
+    pub fn send_key(&self, key: &str) -> bool {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return false;
+        };
+
+        let Ok(binding) = NormalizedShortcut::parse(key) else {
+            return false;
+        };
+        let Some((keyval, modifier)) = gtk::accelerator_parse(binding.to_config_accel()) else {
+            return false;
+        };
+
+        let press = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+        let release = translate_key_event(
+            GHOSTTY_ACTION_RELEASE,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+
+        unsafe {
+            ghostty_surface_key(surface, press);
+            ghostty_surface_key(surface, release);
+        }
+        true
     }
 
     pub fn show_find(&self) -> bool {

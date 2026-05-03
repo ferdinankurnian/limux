@@ -25,7 +25,11 @@ const METHODS: &[&str] = &[
     "workspace.select",
     "workspace.rename",
     "workspace.close",
+    "pane.list",
+    "pane.surfaces",
+    "surface.list",
     "surface.send_text",
+    "surface.send_key",
     "notification.create",
 ];
 
@@ -58,6 +62,19 @@ pub enum ControlCommand {
     ListWorkspaces {
         reply: mpsc::Sender<BridgeResult>,
     },
+    ListPanes {
+        target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ListPaneSurfaces {
+        target: WorkspaceTarget,
+        pane_id: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ListSurfaces {
+        target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CreateWorkspace {
         name: Option<String>,
         cwd: Option<String>,
@@ -83,6 +100,12 @@ pub enum ControlCommand {
         text: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SendKey {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        key: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     /// Post a desktop-style notification into the sidebar + toast overlay.
     /// `target` chooses the workspace to flag as unread; if not provided,
     /// the currently-active workspace is used.
@@ -101,11 +124,15 @@ impl ControlCommand {
             Self::Identify { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
+            | Self::ListPanes { reply, .. }
+            | Self::ListPaneSurfaces { reply, .. }
+            | Self::ListSurfaces { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
+            | Self::SendKey { reply, .. }
             | Self::CreateNotification { reply, .. } => {
                 let _ = reply.send(result);
             }
@@ -264,6 +291,37 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWorkspaces { reply }, rx)
         }
+        "pane.list" | "list-panes" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ListPanes { target, reply }, rx)
+        }
+        "pane.surfaces" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ListPaneSurfaces {
+                    target,
+                    pane_id: optional_string(params, &["pane_id", "id"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.list" | "list-panels" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ListSurfaces { target, reply }, rx)
+        }
         "workspace.create" | "new-workspace" => {
             let (reply, rx) = mpsc::channel();
             (
@@ -332,6 +390,28 @@ fn handle_method(
                     target,
                     surface_hint: optional_string(params, &["surface_id"]),
                     text,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.send_key" | "send-key" => {
+            let Some(key) = optional_string(params, &["key"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.send_key requires key"),
+                );
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SendKey {
+                    target,
+                    surface_hint: optional_string(params, &["surface_id"]),
+                    key,
                     reply,
                 },
                 rx,

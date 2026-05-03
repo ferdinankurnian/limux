@@ -197,7 +197,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] <text>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--url <url>]\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Spawns one workspace per agent, launches each CLI inside it, and writes\n      AGENTS.md describing the <agent-msg> XML protocol so peers can talk via\n      `limux send --workspace <peer-name> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--url <url>]\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Spawns one workspace per agent, launches each CLI inside it, and writes\n      AGENTS.md describing the <agent-msg> XML protocol so peers can talk via\n      `limux send --workspace <peer-name> <envelope>`.\n"
     );
 }
 
@@ -662,16 +662,33 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
         .filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
 
-    call_in_workspace_scope(
-        client,
-        workspace,
-        "surface.send_text",
-        json!({ "text": text }),
-    )
-    .await
+    let mut params = Map::new();
+    params.insert("text".to_string(), Value::String(text));
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+
+    call_in_workspace_scope(client, workspace, "surface.send_text", Value::Object(params)).await
+}
+
+async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
+
+    let mut params = Map::new();
+    params.insert("key".to_string(), Value::String(key));
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+
+    call_in_workspace_scope(client, workspace, "surface.send_key", Value::Object(params)).await
 }
 
 /// `limux notify` — post a notification into the sidebar + toast overlay.
@@ -2193,6 +2210,15 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "send" => {
             let payload = run_send(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                let handle = handle_from_payload(&payload, "surface_id", "surface_ref");
+                CommandOutput::Text(format!("OK {}", handle.trim()))
+            }
+        }
+        "send-key" => {
+            let payload = run_send_key(client, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {

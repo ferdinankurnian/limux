@@ -115,7 +115,7 @@ ahead of `main`):
 | Phase | Feature | Status |
 |---|---|---|
 | 1 | `LIMUX_*` env auto-wired into every pty | ✅ `1295d12` |
-| 2 | **Bridge as full proxy** for `pane.*` / `surface.*` / `notification.*` | 🚧 partial — `surface.send_text` + `notification.create` now accept names (`allow_name=true`, in `6b8eb1a`); `pane.list`, `pane.surfaces`, `surface.list`, `surface.read_text`, `surface.send_key` still unrouted |
+| 2 | **Bridge as full proxy** for `pane.*` / `surface.*` / `notification.*` | 🚧 partial — `pane.list`, `pane.surfaces`, `surface.list`, `surface.send_text`, and `notification.create` are routed on the live GUI bridge; `surface.read_text` and `surface.send_key` are still unrouted |
 | 3 | `limux notify` CLI + `notification.create` bridge route | ✅ `c45d7de` |
 | 4 | `claude-hook` / `opencode-hook` / `gemini-hook` | ✅ `84e2b79` |
 | 5 | `limux agent-team` + auto-generated AGENTS.md | ✅ `6b8eb1a` |

@@ -11,14 +11,14 @@ Limux has **two control servers**:
 2. **Embedded bridge inside `limux-host-linux`** — `control_bridge.rs` only
    routes a narrow subset of methods to the GTK main loop. Supports
    `system.ping`, `system.identify`, `workspace.{current,list,create,
-   select,rename,close}`, `surface.send_text`. **Does NOT support**
-   `pane.list`, `pane.surfaces`, `surface.list`, `surface.read_text`,
-   `surface.send_key`, `notification.*`, or any browser commands.
+   select,rename,close}`, `pane.list`, `pane.surfaces`, `surface.list`,
+   `surface.send_text`, and `notification.create`. It still does **NOT**
+   support `surface.read_text`, `surface.send_key`, or any browser commands.
 
 When the GUI is running, the CLI targets the bridge via the runtime
-socket. `list-panes`, `read-screen`, and most other commands currently
-**error out** against the running host — this is the root blocker for
-the Codex↔Claude workflow.
+socket. `list-panes` / `list-panels` now work against the running host,
+but `read-screen` and key-level injection still error out — those remain
+the main blocker for richer Codex↔Claude workflows.
 
 ## Delivery strategy (revised)
 
@@ -37,22 +37,22 @@ variants that interrogate the live state. The cleanest path:
 - Specific methods that need GTK side-effects (send_text, create_surface,
   notification.create) remain as `ControlCommand` variants.
 
-Remaining work unblocks `list-panes`, `pane.surfaces`, `surface.list`,
-`surface.read_text`, `surface.send_key` against the live GUI — i.e.
-everything needed for agents to discover each other and **read each
-other's screens**.
+Remaining work unblocks `surface.read_text` and `surface.send_key`
+against the live GUI — i.e. the last missing pieces for agents to read
+each other's screens and do deterministic key-level control.
 
-**Shipped so far (in 6b8eb1a, alongside phase 5):**
+**Shipped so far (in 6b8eb1a and follow-up bridge work):**
 
 - `surface.send_text` and `notification.create` now pass `allow_name=true`
   to `parse_optional_workspace_target`, so peers can address each other
   by workspace name (`--workspace claude`) without juggling runtime
   UUIDs. This is what made phase 5 practical.
+- `pane.list`, `pane.surfaces`, and `surface.list` now route on the live
+  GTK bridge, so agents can discover peer panes/surfaces in a running
+  Limux window.
 
 **Still open (priority order):**
 
-- `pane.list` / `pane.surfaces` — agents enumerating the team
-- `surface.list` — agent discovery and peer sanity checks
 - `surface.read_text` — letting an agent read a peer's scrollback /
   current output (biggest unlock for real Codex↔Claude review loops)
 - `surface.send_key` — key-level injection (arrow keys, Ctrl-C, etc.)

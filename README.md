@@ -128,6 +128,12 @@ echo '{"event":"finished"}' | limux gemini-hook --event finished
 limux agent-team --agents codex,claude --cwd "$PWD"
 # → Codex and Claude can now do:
 #   limux send --workspace claude $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
+
+# Or keep both agents in the same workspace on separate splits/tabs:
+limux identify --json
+limux list-panels --workspace "$LIMUX_WORKSPACE_ID"
+limux send --workspace "$LIMUX_WORKSPACE_ID" --surface "<peer-surface-id>" \
+  $'<agent-msg from="codex" to="claude" id="…" ts="…">…</agent-msg>\n'
 ```
 
 See the auto-generated `AGENTS.md` (written into the shared cwd) for
