@@ -323,11 +323,23 @@ fn optional_index(params: &Map<String, Value>, key: &str) -> Result<Option<usize
     )))
 }
 
+fn looks_like_workspace_handle(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.starts_with("workspace:") {
+        return true;
+    }
+    let value = raw;
+    uuid::Uuid::parse_str(value).is_ok() || value.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn parse_optional_workspace_target(
     params: &Map<String, Value>,
     allow_name: bool,
 ) -> Result<WorkspaceTarget, BridgeError> {
     if let Some(handle) = optional_handle(params, &["workspace_id", "id"])? {
+        if allow_name && !looks_like_workspace_handle(&handle) {
+            return Ok(WorkspaceTarget::Name(handle));
+        }
         return Ok(WorkspaceTarget::Handle(handle));
     }
     if allow_name {
@@ -787,6 +799,29 @@ mod tests {
             parse_optional_workspace_target(params.as_object().expect("object params"), true)
                 .expect("target should parse");
         assert_eq!(target, WorkspaceTarget::Handle("workspace:abc".to_string()));
+    }
+
+    #[test]
+    fn workspace_target_treats_cli_workspace_id_as_name_when_allowed() {
+        let params = json!({
+            "workspace_id": "claude"
+        });
+        let target =
+            parse_optional_workspace_target(params.as_object().expect("object params"), true)
+                .expect("target should parse");
+        assert_eq!(target, WorkspaceTarget::Name("claude".to_string()));
+    }
+
+    #[test]
+    fn workspace_target_preserves_raw_uuid_workspace_ids_when_names_are_allowed() {
+        let workspace_id = "2b8b5ca4-0200-4433-9f7c-d5c9f725be50";
+        let params = json!({
+            "workspace_id": workspace_id
+        });
+        let target =
+            parse_optional_workspace_target(params.as_object().expect("object params"), true)
+                .expect("target should parse");
+        assert_eq!(target, WorkspaceTarget::Handle(workspace_id.to_string()));
     }
 
     #[test]
