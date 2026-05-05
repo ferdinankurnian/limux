@@ -60,20 +60,15 @@ pub struct FocusConfig {
     pub hover_terminal_focus: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotificationSound {
+    #[default]
     Default,
     Message,
     Bell,
     Complete,
     Alert,
     None,
-}
-
-impl Default for NotificationSound {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl NotificationSound {
