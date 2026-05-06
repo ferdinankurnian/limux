@@ -197,7 +197,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] <text>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--url <url>]\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -313,6 +313,18 @@ fn trailing_title(args: &[String]) -> Option<String> {
             || arg == "--timeout-ms"
             || arg == "--name"
             || arg == "--out"
+            || arg == "--subtitle"
+            || arg == "--body"
+            || arg == "--message"
+            || arg == "--event"
+            || arg == "--agents"
+            || arg == "--selector"
+            || arg == "--text"
+            || arg == "--attr"
+            || arg == "--property"
+            || arg == "--value"
+            || arg == "--amount"
+            || arg == "--unset"
         {
             skip = true;
             continue;
@@ -662,14 +674,237 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
         .filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
+
+    let mut params = Map::new();
+    params.insert("text".to_string(), Value::String(text));
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
 
     call_in_workspace_scope(
         client,
         workspace,
         "surface.send_text",
-        json!({ "text": text }),
+        Value::Object(params),
+    )
+    .await
+}
+
+async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
+
+    let mut params = Map::new();
+    params.insert("key".to_string(), Value::String(key));
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+
+    call_in_workspace_scope(client, workspace, "surface.send_key", Value::Object(params)).await
+}
+
+/// `limux notify` — post a notification into the sidebar + toast overlay.
+///
+/// Usage:
+///   limux notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>
+///   limux notify --title "..." --subtitle "..." --body "..."
+///
+/// Mirrors the `cmux notify` shape (title / subtitle / body). Title is
+/// required; subtitle and body are optional. Falls back to the current
+/// workspace via LIMUX_WORKSPACE_ID when --workspace isn't given.
+async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty());
+
+    // Title can be provided either via --title or as the trailing positional
+    // (matching `limux send`'s ergonomics).
+    let title = parse_opt(args, "--title")
+        .or_else(|| trailing_title(args))
+        .ok_or_else(|| anyhow!("notify requires a title"))?;
+
+    let subtitle = parse_opt(args, "--subtitle").unwrap_or_default();
+    let body = parse_opt(args, "--body")
+        .or_else(|| parse_opt(args, "--message"))
+        .unwrap_or_default();
+
+    let mut params = Map::new();
+    params.insert("title".to_string(), Value::String(title));
+    if !subtitle.is_empty() {
+        params.insert("subtitle".to_string(), Value::String(subtitle));
+    }
+    if !body.is_empty() {
+        params.insert("body".to_string(), Value::String(body));
+    }
+
+    call_in_workspace_scope(
+        client,
+        workspace,
+        "notification.create",
+        Value::Object(params),
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Agent hooks (claude-hook / opencode-hook / gemini-hook)
+// ---------------------------------------------------------------------------
+//
+// These subcommands read a JSON hook event from stdin and translate it into
+// a `notify` (and, eventually, log / progress) call so the GUI reflects
+// agent activity in real time. Designed for direct wiring into Claude Code,
+// OpenCode, and Gemini CLI's hook settings.
+//
+// Claude Code stdin schema (what we rely on):
+//   {
+//     "session_id": "...",
+//     "transcript_path": "...",
+//     "cwd": "...",
+//     "hook_event_name": "Notification" | "Stop" | "SessionStart" | ...,
+//     "message": "agent is waiting for input",     // Notification only
+//     "tool_name": "...", "tool_input": {...},     // PreToolUse/PostToolUse
+//     "tool_response": {...},                       // PostToolUse
+//     "prompt": "..."                               // UserPromptSubmit
+//   }
+//
+// OpenCode and Gemini use slightly different names; we fall back gracefully
+// when fields are missing.
+
+#[derive(Clone, Copy, Debug)]
+enum AgentKind {
+    Claude,
+    OpenCode,
+    Gemini,
+}
+
+impl AgentKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+        }
+    }
+}
+
+/// Pull a string field from the hook JSON, trying multiple keys.
+fn hook_str<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| payload.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_hook_event(args: &[String], payload: &Value) -> String {
+    parse_opt(args, "--event")
+        .or_else(|| trailing_title(args))
+        .or_else(|| hook_str(payload, &["hook_event_name", "event"]).map(str::to_owned))
+        .unwrap_or_else(|| "event".to_string())
+}
+
+/// Run an agent hook: read JSON from stdin, synthesize a notification.
+///
+/// Args:
+///   [event_name] — optional positional, e.g. "Notification", "Stop".
+///                  If omitted, we read `hook_event_name` from the JSON.
+async fn run_agent_hook(client: &mut Client, agent: AgentKind, args: &[String]) -> Result<Value> {
+    use std::io::Read;
+
+    // Read stdin (hook JSON). If stdin is empty or not JSON, treat as
+    // minimal event so we still post *something*.
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let raw = raw.trim();
+    let payload: Value = if raw.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
+    };
+
+    // Explicit --event or positional event beats the JSON field.
+    let event = parse_hook_event(args, &payload);
+
+    // Build a human-friendly title + body depending on event + agent.
+    let agent_label = agent.label();
+    let (title, body) = match event.as_str() {
+        "Notification" => (
+            format!("{agent_label} needs you"),
+            hook_str(&payload, &["message", "notification"])
+                .unwrap_or("waiting for input")
+                .to_owned(),
+        ),
+        "Stop" | "SubagentStop" => (
+            format!("{agent_label} finished"),
+            hook_str(&payload, &["message", "reason"])
+                .unwrap_or("task complete")
+                .to_owned(),
+        ),
+        "SessionStart" => (
+            format!("{agent_label} session started"),
+            hook_str(&payload, &["cwd", "source"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        "SessionEnd" => (
+            format!("{agent_label} session ended"),
+            hook_str(&payload, &["reason"]).unwrap_or("").to_owned(),
+        ),
+        "PreToolUse" | "PostToolUse" => (
+            format!(
+                "{agent_label}: {}",
+                hook_str(&payload, &["tool_name"]).unwrap_or("tool")
+            ),
+            hook_str(&payload, &["tool_input", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        "UserPromptSubmit" => (
+            format!("{agent_label}: new prompt"),
+            hook_str(&payload, &["prompt"])
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect(),
+        ),
+        other => (
+            format!("{agent_label}: {other}"),
+            hook_str(&payload, &["message", "summary"])
+                .unwrap_or("")
+                .to_owned(),
+        ),
+    };
+
+    let subtitle = hook_str(&payload, &["session_id"])
+        .map(|s| {
+            // Show only a short prefix of the session id to keep sidebar tidy.
+            s.chars().take(8).collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty());
+
+    let mut params = Map::new();
+    params.insert("title".to_string(), Value::String(title));
+    if !subtitle.is_empty() {
+        params.insert("subtitle".to_string(), Value::String(subtitle));
+    }
+    if !body.is_empty() {
+        params.insert("body".to_string(), Value::String(body));
+    }
+
+    call_in_workspace_scope(
+        client,
+        workspace,
+        "notification.create",
+        Value::Object(params),
     )
     .await
 }
@@ -697,6 +932,412 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
         .await;
 
     Ok(created)
+}
+
+// ---------------------------------------------------------------------------
+// `limux agent-team` — spin up a multi-agent collaboration workspace.
+// ---------------------------------------------------------------------------
+//
+// Creates ONE workspace and one pane per requested agent (codex / claude /
+// opencode / gemini), launches each agent's CLI in its pane, captures the
+// pane/surface IDs, and seeds an AGENTS.md in the shared cwd describing the
+// XML-tagged message protocol and the peer directory so agents can message
+// each other.
+//
+// The protocol (codified in AGENTS.md):
+//   To send a message to a peer, run from any terminal:
+//     limux send --surface <peer-surface-id> \\
+//       $'<agent-msg from="<me>" to="<peer>" ts="<iso-8601>">\\n...\\n</agent-msg>\\n'
+//
+// Peers read their own terminals normally — the text appears at the prompt.
+// Each agent should watch for <agent-msg from="..."> blocks and reply with
+// the same envelope targeted back.
+
+/// Built-in agent launcher commands. Chosen to match the CLIs the user
+/// actually has installed (see README); the launch command is what gets
+/// typed into the new workspace's terminal, so it also works as a fallback
+/// shell command if the CLI isn't in PATH yet.
+fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
+    match agent.to_lowercase().as_str() {
+        "codex" => Some(("codex", "codex".to_string())),
+        "claude" | "claude-code" => Some(("claude", "claude".to_string())),
+        "opencode" => Some(("opencode", "opencode".to_string())),
+        "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
+        _ => None,
+    }
+}
+
+async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
+    // Parse --agents codex,claude (default: codex,claude).
+    let agents_raw = parse_opt(args, "--agents").unwrap_or_else(|| "codex,claude".to_string());
+    let agents: Vec<String> = agents_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if agents.is_empty() {
+        bail!("agent-team: --agents is empty");
+    }
+
+    let cwd = parse_opt(args, "--cwd")
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| anyhow!("agent-team: could not resolve --cwd"))?;
+
+    // Optional: skip launching the CLIs (useful when the user wants to open
+    // the agents manually) — still splits the panes + writes AGENTS.md.
+    let no_launch = args.iter().any(|a| a == "--no-launch");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    // Resolve the agent list up front so --dry-run can build a deterministic
+    // peer table without touching the host.
+    let resolved: Vec<(String, &'static str, String)> = agents
+        .iter()
+        .filter_map(|agent| {
+            agent_launch_command(agent).map(|(name, launch)| (agent.clone(), name, launch))
+        })
+        .collect();
+    for agent in &agents {
+        if agent_launch_command(agent).is_none() {
+            eprintln!("agent-team: unknown agent '{agent}', skipping");
+        }
+    }
+    if resolved.is_empty() {
+        bail!("agent-team: no valid agents spawned");
+    }
+
+    let agents_md_path = std::path::Path::new(&cwd).join("AGENTS.md");
+
+    if dry_run {
+        let peers: Vec<(String, String, String, String)> = resolved
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name, launch))| {
+                (
+                    name.to_string(),
+                    format!("<dry-run-pane-{i}>"),
+                    format!("<dry-run-surface-{name}>"),
+                    launch.clone(),
+                )
+            })
+            .collect();
+        let body = build_agents_md(
+            &peers,
+            &cwd,
+            "<active-workspace>",
+            "<dry-run-workspace>",
+            "<dry-run-orchestrator>",
+        );
+        if let Err(err) = std::fs::write(&agents_md_path, body) {
+            eprintln!(
+                "agent-team: failed to write {}: {err}",
+                agents_md_path.display()
+            );
+        }
+        return Ok(json!({
+            "ok": true,
+            "cwd": cwd,
+            "workspace_name": "<active-workspace>",
+            "workspace_id": Value::Null,
+            "orchestrator_surface_id": Value::Null,
+            "agents_md": agents_md_path.to_string_lossy(),
+            "dry_run": true,
+            "no_launch": no_launch,
+            "peers": peers
+                .iter()
+                .map(|(name, pane, surface, launch)| {
+                    json!({
+                        "agent": name,
+                        "pane_id": pane,
+                        "surface_id": surface,
+                        "launch_command": launch,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    // 1. Resolve the orchestrator's workspace + pane. Prefer LIMUX_* env (set
+    //    in every limux-spawned terminal) and fall back to the host's active
+    //    focus so callers from a regular shell still work.
+    let orchestrator_workspace = env::var("LIMUX_WORKSPACE_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let orchestrator_surface_env = env::var("LIMUX_SURFACE_ID").ok().filter(|s| !s.is_empty());
+    let orchestrator_pane_env = env::var("LIMUX_PANE_ID").ok().filter(|s| !s.is_empty());
+
+    let workspace_id = match orchestrator_workspace.clone() {
+        Some(id) => id,
+        None => resolve_current_workspace(client)
+            .await
+            .context("agent-team: could not resolve active workspace; run from inside a limux pane or pass --workspace")?,
+    };
+
+    // 2. Discover the orchestrator pane's surface_id. If env didn't tell us,
+    //    use the focused/first surface in the workspace.
+    let surfaces = client
+        .call(
+            "surface.list",
+            json!({ "workspace_id": workspace_id.clone() }),
+        )
+        .await
+        .context("surface.list failed for active workspace")?;
+    let surface_rows = surfaces
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if surface_rows.is_empty() {
+        bail!("agent-team: active workspace has no surfaces");
+    }
+    let orchestrator_surface = orchestrator_surface_env.clone().unwrap_or_else(|| {
+        surface_rows
+            .iter()
+            .find(|row| row.get("focused").and_then(Value::as_bool) == Some(true))
+            .and_then(|row| get_string(row, &["surface_id"]))
+            .or_else(|| get_string(&surface_rows[0], &["surface_id"]))
+            .unwrap_or_default()
+    });
+    if orchestrator_surface.is_empty() {
+        bail!("agent-team: could not determine orchestrator surface");
+    }
+    let orchestrator_pane = orchestrator_pane_env.unwrap_or_else(|| {
+        surface_rows
+            .iter()
+            .find(|row| {
+                get_string(row, &["surface_id"]).as_deref() == Some(orchestrator_surface.as_str())
+            })
+            .and_then(|row| get_string(row, &["pane_id"]))
+            .unwrap_or_default()
+    });
+
+    // 3. Workspace name (for AGENTS.md header) — best-effort lookup.
+    let workspace_name = client
+        .call("workspace.list", json!({}))
+        .await
+        .ok()
+        .and_then(|v| v.get("workspaces").and_then(Value::as_array).cloned())
+        .and_then(|rows| {
+            rows.into_iter().find(|row| {
+                get_string(row, &["workspace_id", "id"]).as_deref() == Some(workspace_id.as_str())
+            })
+        })
+        .and_then(|row| get_string(&row, &["name", "title"]))
+        .unwrap_or_else(|| "active workspace".to_string());
+
+    // 4. Split a pane per agent. Layout: agent[0] splits RIGHT of orchestrator,
+    //    each subsequent agent splits DOWN of the previous agent — orchestrator
+    //    keeps its full height on the left, peers stack top-to-bottom on the right.
+    let mut peers: Vec<(String, String, String, String)> = Vec::new();
+    let mut parent_surface = orchestrator_surface.clone();
+
+    for (i, (_alias, name, launch)) in resolved.iter().enumerate() {
+        let direction = if i == 0 { "right" } else { "down" };
+
+        let mut params = Map::new();
+        params.insert(
+            "workspace_id".to_string(),
+            Value::String(workspace_id.clone()),
+        );
+        params.insert(
+            "surface_id".to_string(),
+            Value::String(parent_surface.clone()),
+        );
+        params.insert(
+            "direction".to_string(),
+            Value::String(direction.to_string()),
+        );
+        params.insert("type".to_string(), Value::String("terminal".to_string()));
+        if !no_launch {
+            params.insert("command".to_string(), Value::String(launch.clone()));
+        }
+
+        let created = client
+            .call("pane.create", Value::Object(params))
+            .await
+            .with_context(|| format!("pane.create failed for agent '{name}'"))?;
+        let pane_id = get_string(&created, &["pane_id"])
+            .ok_or_else(|| anyhow!("agent-team: pane.create for '{name}' returned no pane_id"))?;
+        let surface_id = get_string(&created, &["surface_id"]).ok_or_else(|| {
+            anyhow!("agent-team: pane.create for '{name}' returned no surface_id")
+        })?;
+
+        parent_surface = surface_id.clone();
+        peers.push((name.to_string(), pane_id, surface_id, launch.clone()));
+    }
+
+    // 5. Write AGENTS.md into the shared cwd, clobbering any existing file.
+    let body = build_agents_md(
+        &peers,
+        &cwd,
+        &workspace_name,
+        &workspace_id,
+        &orchestrator_surface,
+    );
+    if let Err(err) = std::fs::write(&agents_md_path, body) {
+        eprintln!(
+            "agent-team: failed to write {}: {err}",
+            agents_md_path.display()
+        );
+    }
+
+    Ok(json!({
+        "ok": true,
+        "cwd": cwd,
+        "workspace_name": workspace_name,
+        "workspace_id": workspace_id,
+        "orchestrator_pane_id": orchestrator_pane,
+        "orchestrator_surface_id": orchestrator_surface,
+        "agents_md": agents_md_path.to_string_lossy(),
+        "dry_run": false,
+        "no_launch": no_launch,
+        "peers": peers
+            .iter()
+            .map(|(name, pane, surface, launch)| {
+                json!({
+                    "agent": name,
+                    "pane_id": pane,
+                    "surface_id": surface,
+                    "launch_command": launch,
+                })
+            })
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn build_agents_md(
+    peers: &[(String, String, String, String)],
+    cwd: &str,
+    workspace_name: &str,
+    workspace_id: &str,
+    orchestrator_surface: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# AGENTS.md — agent-to-agent message protocol\n\n");
+    out.push_str(
+        "This file is auto-generated by `limux agent-team`. It defines how the\n\
+         agents running in this workspace team communicate with each other via\n\
+         the limux control socket. Humans should feel free to edit the\n\
+         'Policies' section below; everything else is mechanical.\n\n",
+    );
+
+    out.push_str(&format!(
+        "## Team workspace\n\n\
+         The orchestrator (the pane that ran `limux agent-team`) and all\n\
+         spawned peers share one workspace:\n\n\
+         - Workspace name: `{workspace_name}`\n\
+         - Workspace ID: `{workspace_id}`\n\
+         - Orchestrator surface: `{orchestrator_surface}`\n\
+         - Shared cwd: `{cwd}`\n\n",
+    ));
+
+    out.push_str("## Peers in this team\n\n");
+    out.push_str("| Agent | Pane | Surface | Launch command |\n");
+    out.push_str("|-------|------|---------|----------------|\n");
+    for (name, pane_id, surface_id, launch) in peers {
+        out.push_str(&format!(
+            "| `{name}` | `{pane_id}` | `{surface_id}` | `{launch}` |\n"
+        ));
+    }
+    out.push('\n');
+    out.push_str(
+        "The orchestrator is not in the table — message it back using its\n\
+         `Orchestrator surface` from the block above.\n\n",
+    );
+
+    out.push_str("## How to send a message\n\n");
+    out.push_str(
+        "Messages use the `<agent-msg>` XML envelope so they're easy to\n\
+         extract from the terminal scrollback. To send a message to a peer,\n\
+         look up their `Surface` in the peers table above and run (from any\n\
+         shell, including the agent's own terminal — `limux` is on PATH):\n\n",
+    );
+    out.push_str("```bash\n");
+    out.push_str("limux send --surface <peer-surface-id> $'<agent-msg from=\"<me>\" to=\"<peer>\" id=\"<uuid>\" ts=\"<iso8601>\">\\n<body/>\\n</agent-msg>\\n'\n");
+    out.push_str("```\n\n");
+    out.push_str(
+        "The message appears at the peer's prompt as plain stdin, so the\n\
+         peer's agent CLI picks it up like a normal user message. Trailing\n\
+         newline is required so the agent's read-line actually fires.\n\n",
+    );
+
+    out.push_str("### Envelope format\n\n");
+    out.push_str("```xml\n");
+    out.push_str("<agent-msg from=\"codex\" to=\"claude\" id=\"<uuid>\" ts=\"2026-04-19T16:48:00Z\" reply-to=\"<parent-uuid>\">\n");
+    out.push_str(
+        "  <context>optional: one or two sentences about what the request is for</context>\n",
+    );
+    out.push_str("  <request>the actual ask, in prose or code</request>\n");
+    out.push_str("  <expect>how you want the peer to reply (\"inline code diff\" / \"short summary\" / etc.)</expect>\n");
+    out.push_str("</agent-msg>\n");
+    out.push_str("```\n\n");
+
+    out.push_str("Rules:\n");
+    out.push_str("- `from` / `to` MUST be one of the agent names in the peers table.\n");
+    out.push_str("- `id` is a fresh UUID (e.g. `uuidgen`); peers echo it in `reply-to`.\n");
+    out.push_str("- `ts` is ISO-8601 UTC (`date -u +%Y-%m-%dT%H:%M:%SZ`).\n");
+    out.push_str("- Inner tags are guidance, not required — `<request>` alone is fine.\n");
+    out.push_str("- Keep bodies short; link to files in the shared cwd for anything long.\n\n");
+
+    out.push_str("### Replying\n\n");
+    out.push_str("Reply with the envelope reversed and `reply-to` set to the original `id`:\n\n");
+    out.push_str("```bash\n");
+    out.push_str("limux send --surface <orig-sender-surface-id> $'<agent-msg from=\"claude\" to=\"codex\" id=\"<new-uuid>\" reply-to=\"<orig-uuid>\" ts=\"<iso8601>\">\\n<response>...</response>\\n</agent-msg>\\n'\n");
+    out.push_str("```\n\n");
+
+    out.push_str("## Pinging the human\n\n");
+    out.push_str(
+        "When you need human input, use `limux notify` — it pops a toast\n\
+         and lights up the workspace in the sidebar. Example:\n\n",
+    );
+    out.push_str("```bash\n");
+    out.push_str("limux notify --subtitle 'needs review' --body 'Claude blocked on auth choice' 'Input needed'\n");
+    out.push_str("```\n\n");
+
+    out.push_str("## Environment contract\n\n");
+    out.push_str(
+        "Every pane spawned by limux inherits:\n\
+         - `LIMUX_WORKSPACE_ID` — the team workspace's UUID\n\
+         - `LIMUX_SURFACE_ID` — this pane's surface id (this is your `from`)\n\
+         - `LIMUX_PANE_ID`, `LIMUX_TAB_ID`\n\
+         - `LIMUX_SOCKET` — the control socket path\n\n\
+         This means `limux identify`, `limux send` (with `--surface`), and\n\
+         `limux notify` all auto-target the right thing with no flags needed\n\
+         from inside the agent's own terminal.\n\n",
+    );
+
+    out.push_str("## Splitting your own pane\n\n");
+    out.push_str("If you need a scratch terminal next to you, split your own pane:\n\n");
+    out.push_str("```bash\n");
+    out.push_str("limux new-pane --direction right --command bash\n");
+    out.push_str("```\n\n");
+    out.push_str(
+        "`new-pane` reads `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and\n\
+         `LIMUX_PANE_ID`, so it splits your current pane even if GTK focus has\n\
+         moved elsewhere. Live GTK self-spawn currently supports terminal\n\
+         panes only; browser pane creation is deferred.\n\n",
+    );
+
+    out.push_str("## Policies (edit these freely)\n\n");
+    out.push_str(
+        "- If a peer is silent for more than 60 seconds, re-send with `reply-to` = your last id.\n",
+    );
+    out.push_str(
+        "- Never send more than 200 lines at once; write to a file and send the path instead.\n",
+    );
+    out.push_str("- If two agents disagree on an approach, both message the human via `limux notify` and stop.\n");
+    out.push_str("- Before taking destructive actions (rm, git push, kubectl apply), ask the human via `limux notify`.\n\n");
+
+    out.push_str("---\n");
+    out.push_str(
+        "_Generated by `limux agent-team`. Safe to edit the Policies\n\
+         section; regenerating will overwrite everything above it._\n",
+    );
+
+    out
 }
 
 async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -762,19 +1403,55 @@ async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> 
     call_in_workspace_scope(client, workspace, "surface.create", json!({})).await
 }
 
-async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace");
+fn env_opt(name: &str) -> Option<String> {
+    env::var(name).ok()
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.trim().is_empty())
+}
+
+fn build_new_pane_request(
+    args: &[String],
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Value) {
+    let workspace =
+        nonempty(parse_opt(args, "--workspace").or_else(|| env_lookup("LIMUX_WORKSPACE_ID")));
+    let surface = nonempty(parse_opt(args, "--surface").or_else(|| env_lookup("LIMUX_SURFACE_ID")));
+    let pane = nonempty(parse_opt(args, "--pane").or_else(|| env_lookup("LIMUX_PANE_ID")));
     let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
     let pane_type = parse_opt(args, "--type").unwrap_or_else(|| "terminal".to_string());
-    let url = parse_opt(args, "--url");
+    let command = nonempty(parse_opt(args, "--command"));
+    let url = nonempty(parse_opt(args, "--url"));
+
     let mut params = Map::new();
     params.insert("direction".to_string(), Value::String(direction));
     params.insert("type".to_string(), Value::String(pane_type));
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+    if let Some(pane) = pane {
+        params.insert("pane_id".to_string(), Value::String(pane));
+    }
+    if let Some(command) = command {
+        params.insert("command".to_string(), Value::String(command));
+    }
     if let Some(url) = url {
         params.insert("url".to_string(), Value::String(url));
     }
 
-    call_in_workspace_scope(client, workspace, "pane.create", Value::Object(params)).await
+    (workspace, Value::Object(params))
+}
+
+async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
+    // `pane.create` contract shared with the core dispatcher and live GTK host:
+    // direction/type are validated by the server, and responses keep
+    // pane_id/pane_ref/surface_id/surface_ref. Inside a Limux terminal,
+    // LIMUX_* defaults make `limux new-pane --command claude` split the
+    // caller's pane; outside Limux, omitting workspace preserves active-focus
+    // server behavior.
+    let (workspace, params) = build_new_pane_request(args, env_opt);
+    call_in_workspace_scope(client, workspace, "pane.create", params).await
 }
 
 async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -1750,6 +2427,37 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(format!("OK {}", handle.trim()))
             }
         }
+        "send-key" => {
+            let payload = run_send_key(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                let handle = handle_from_payload(&payload, "surface_id", "surface_ref");
+                CommandOutput::Text(format!("OK {}", handle.trim()))
+            }
+        }
+        "notify" => {
+            let payload = run_notify(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "claude-hook" | "opencode-hook" | "gemini-hook" => {
+            let agent = match command {
+                "claude-hook" => AgentKind::Claude,
+                "opencode-hook" => AgentKind::OpenCode,
+                "gemini-hook" => AgentKind::Gemini,
+                _ => unreachable!(),
+            };
+            let payload = run_agent_hook(client, agent, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "new-workspace" => {
             let payload = run_new_workspace(client, args).await?;
             if opts.json_output {
@@ -1765,6 +2473,34 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Json(payload)
             } else {
                 CommandOutput::Text("OK".to_string())
+            }
+        }
+        "agent-team" => {
+            let payload = run_agent_team(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                let agents_md = payload
+                    .get("agents_md")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("AGENTS.md");
+                let workspace = payload
+                    .get("workspace_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let peers = payload
+                    .get("peers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|p| p.get("agent").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                CommandOutput::Text(format!(
+                    "OK agent-team workspace={workspace} peers=[{peers}] agents_md={agents_md}"
+                ))
             }
         }
         "sidebar-state" => {
@@ -1917,5 +2653,212 @@ async fn main() -> Result<()> {
             eprintln!("{}", err);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_arg_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn notify_positional_title_skips_option_values() {
+        let args = args(&[
+            "--subtitle",
+            "needs review",
+            "--body",
+            "blocked",
+            "Input needed",
+        ]);
+
+        assert_eq!(trailing_title(&args).as_deref(), Some("Input needed"));
+    }
+
+    #[test]
+    fn hook_event_comes_from_json_after_option_values() {
+        let args = args(&["--workspace", "codex"]);
+        let payload = json!({ "hook_event_name": "Notification" });
+
+        assert_eq!(parse_hook_event(&args, &payload), "Notification");
+    }
+
+    #[test]
+    fn hook_event_prefers_explicit_event_flag() {
+        let args = args(&["--workspace", "codex", "--event", "Stop"]);
+        let payload = json!({ "hook_event_name": "Notification" });
+
+        assert_eq!(parse_hook_event(&args, &payload), "Stop");
+    }
+
+    #[test]
+    fn hook_event_accepts_positional_event_after_options() {
+        let args = args(&["--workspace", "codex", "Stop"]);
+        let payload = json!({ "hook_event_name": "Notification" });
+
+        assert_eq!(parse_hook_event(&args, &payload), "Stop");
+    }
+}
+
+#[cfg(test)]
+mod agent_team_tests {
+    use super::*;
+
+    #[test]
+    fn agent_launch_known() {
+        for agent in [
+            "codex",
+            "claude",
+            "claude-code",
+            "opencode",
+            "gemini",
+            "gemini-cli",
+        ] {
+            assert!(
+                agent_launch_command(agent).is_some(),
+                "expected '{agent}' to be a known agent"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_launch_unknown_returns_none() {
+        assert!(agent_launch_command("nonsense-cli").is_none());
+    }
+
+    #[test]
+    fn agents_md_contains_protocol_and_peers() {
+        let peers = vec![
+            (
+                "codex".to_string(),
+                "10".to_string(),
+                "10:tab-a".to_string(),
+                "codex".to_string(),
+            ),
+            (
+                "claude".to_string(),
+                "11".to_string(),
+                "11:tab-a".to_string(),
+                "claude".to_string(),
+            ),
+        ];
+        let md = build_agents_md(
+            &peers,
+            "/tmp/team",
+            "active-ws",
+            "ws-uuid-123",
+            "9:terminal-orch",
+        );
+
+        // Header & generation marker
+        assert!(md.contains("AGENTS.md — agent-to-agent message protocol"));
+        assert!(md.contains("Generated by `limux agent-team`"));
+
+        // Team workspace block
+        assert!(md.contains("Workspace name: `active-ws`"));
+        assert!(md.contains("Workspace ID: `ws-uuid-123`"));
+        assert!(md.contains("Orchestrator surface: `9:terminal-orch`"));
+        assert!(md.contains("Shared cwd: `/tmp/team`"));
+
+        // Peer table rows (Agent | Pane | Surface | Launch)
+        assert!(md.contains("| `codex` | `10` | `10:tab-a` | `codex` |"));
+        assert!(md.contains("| `claude` | `11` | `11:tab-a` | `claude` |"));
+
+        // Protocol envelope spec uses --surface, not --workspace
+        assert!(md.contains("<agent-msg from=\"codex\" to=\"claude\""));
+        assert!(md.contains("limux send --surface"));
+        assert!(!md.contains("limux send --workspace"));
+        assert!(md.contains("reply-to"));
+
+        // Notify + env contract
+        assert!(md.contains("limux notify"));
+        assert!(md.contains("LIMUX_WORKSPACE_ID"));
+        assert!(md.contains("LIMUX_SURFACE_ID"));
+        assert!(md.contains("limux new-pane --direction right --command bash"));
+        assert!(md.contains("Live GTK self-spawn currently supports terminal"));
+    }
+}
+
+#[cfg(test)]
+mod new_pane_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn test_env(name: &str) -> Option<String> {
+        match name {
+            "LIMUX_WORKSPACE_ID" => Some("workspace:agent".to_string()),
+            "LIMUX_SURFACE_ID" => Some("surface:11:tab-a".to_string()),
+            "LIMUX_PANE_ID" => Some("pane:11".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn new_pane_serializes_env_defaults_and_command() {
+        let (workspace, params) = build_new_pane_request(&args(&["--command", "claude"]), test_env);
+
+        assert_eq!(workspace.as_deref(), Some("workspace:agent"));
+        assert_eq!(
+            params,
+            json!({
+                "direction": "right",
+                "type": "terminal",
+                "surface_id": "surface:11:tab-a",
+                "pane_id": "pane:11",
+                "command": "claude"
+            })
+        );
+    }
+
+    #[test]
+    fn new_pane_flags_override_env_and_preserve_raw_refs() {
+        let (workspace, params) = build_new_pane_request(
+            &args(&[
+                "--workspace",
+                "raw-workspace",
+                "--surface",
+                "7:tab-b",
+                "--pane",
+                "7",
+                "--direction",
+                "down",
+                "--type",
+                "terminal",
+                "--command",
+                "codex --ask-for-approval never",
+            ]),
+            test_env,
+        );
+
+        assert_eq!(workspace.as_deref(), Some("raw-workspace"));
+        assert_eq!(
+            params,
+            json!({
+                "direction": "down",
+                "type": "terminal",
+                "surface_id": "7:tab-b",
+                "pane_id": "7",
+                "command": "codex --ask-for-approval never"
+            })
+        );
+    }
+
+    #[test]
+    fn new_pane_without_env_preserves_active_workspace_fallback() {
+        let (workspace, params) = build_new_pane_request(&args(&[]), |_| None);
+
+        assert_eq!(workspace, None);
+        assert_eq!(
+            params,
+            json!({
+                "direction": "right",
+                "type": "terminal"
+            })
+        );
     }
 }
