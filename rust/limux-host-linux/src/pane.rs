@@ -3030,7 +3030,6 @@ fn configure_browser_settings(settings: &webkit6::Settings) {
 
     if is_kde_wayland_session() {
         settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
-        settings.set_enable_2d_canvas_acceleration(false);
     }
 }
 
