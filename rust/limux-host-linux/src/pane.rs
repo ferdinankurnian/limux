@@ -1024,6 +1024,7 @@ fn make_terminal_callbacks(
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
+    let callbacks_for_identity = internals.callbacks.clone();
     let tab_strip = internals.tab_strip.clone();
     let content_stack = internals.content_stack.clone();
     let tab_state = internals.tab_state.clone();
@@ -1087,6 +1088,18 @@ fn make_terminal_callbacks(
                 );
             });
         }),
+        on_open_url: Box::new({
+            let pane_outer = internals.pane_outer.clone();
+            move |url, external| {
+                if external {
+                    open_url_in_external_browser(url);
+                    return;
+                }
+
+                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
+                add_browser_tab_to_pane_with_uri(&pane_widget, Some(url));
+            }
+        }),
         on_open_browser_here: Box::new({
             let pane_outer = internals.pane_outer.clone();
             move || {
@@ -1115,6 +1128,25 @@ fn make_terminal_callbacks(
                 (callbacks_for_keybinds.on_open_keybinds)(&pane_widget);
             }
         }),
+        identity: Box::new({
+            let pane_outer = internals.pane_outer.clone();
+            let surface_id = format!("{}:{}", internals.pane_id, tab_id);
+            move || {
+                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
+                terminal::TerminalIdentity {
+                    workspace_id: (callbacks_for_identity.workspace_for_pane)(&pane_widget),
+                    surface_id: surface_id.clone(),
+                }
+            }
+        }),
+    }
+}
+
+fn open_url_in_external_browser(url: &str) {
+    if let Err(err) =
+        gtk::gio::AppInfo::launch_default_for_uri(url, None::<&gtk::gio::AppLaunchContext>)
+    {
+        eprintln!("limux: failed to open URL in external browser: {err}");
     }
 }
 

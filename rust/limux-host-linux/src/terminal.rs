@@ -41,8 +41,16 @@ type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
 type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
 type BellCallback = dyn Fn(bool);
+type OpenUrlCallback = dyn Fn(&str, bool);
 type VoidCallback = dyn Fn();
 type WidgetCallback = dyn Fn(&gtk::Widget);
+type IdentityCallback = dyn Fn() -> TerminalIdentity;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalIdentity {
+    pub workspace_id: Option<String>,
+    pub surface_id: String,
+}
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
@@ -55,7 +63,9 @@ struct SurfaceEntry {
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
     on_bell: Option<Box<BellCallback>>,
+    on_open_url: Option<Box<OpenUrlCallback>>,
     on_close: Option<Box<VoidCallback>>,
+    open_url_external: Rc<Cell<bool>>,
     clipboard_context: *mut ClipboardContext,
 }
 
@@ -722,6 +732,30 @@ unsafe extern "C" fn ghostty_action_cb(
             }
             true
         }
+        GHOSTTY_ACTION_OPEN_URL => {
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let open_url = unsafe { action.action.open_url };
+                if let Some(url) = ghostty_open_url_to_string(open_url) {
+                    let external = SURFACE_MAP.with(|map| {
+                        map.borrow()
+                            .get(&surface_key)
+                            .map(|entry| entry.open_url_external.get())
+                            .unwrap_or(false)
+                    });
+                    glib::idle_add_local_once(move || {
+                        SURFACE_MAP.with(|map| {
+                            if let Some(entry) = map.borrow().get(&surface_key) {
+                                if let Some(cb) = &entry.on_open_url {
+                                    cb(&url, external);
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            true
+        }
         GHOSTTY_ACTION_RING_BELL => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
@@ -772,6 +806,15 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         _ => false,
     }
+}
+
+fn ghostty_open_url_to_string(open_url: ghostty_action_open_url_s) -> Option<String> {
+    if open_url.url.is_null() || open_url.len == 0 {
+        return None;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(open_url.url.cast::<u8>(), open_url.len) };
+    Some(String::from_utf8_lossy(bytes).to_string())
 }
 
 unsafe fn clipboard_surface_from_userdata(userdata: *mut c_void) -> Option<ghostty_surface_t> {
@@ -1000,10 +1043,12 @@ pub struct TerminalCallbacks {
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
     pub on_close: Box<VoidCallback>,
+    pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
+    pub identity: Box<IdentityCallback>,
 }
 
 pub struct TerminalOptions {
@@ -1067,6 +1112,7 @@ pub fn create_terminal(
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
     let scrollbar_syncing = Rc::new(Cell::new(false));
+    let open_url_external = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
 
@@ -1189,6 +1235,7 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
         let scrollbar_syncing = scrollbar_syncing.clone();
+        let open_url_external_for_map = open_url_external.clone();
         let extra_env = extra_env.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
@@ -1338,6 +1385,13 @@ pub fn create_terminal(
                                 (callbacks.on_bell)(source_focused);
                             }
                         })),
+                        on_open_url: Some(Box::new({
+                            let cb = callbacks.clone();
+                            move |url, external| {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_open_url)(url, external);
+                            }
+                        })),
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
                             move || {
@@ -1345,6 +1399,7 @@ pub fn create_terminal(
                                 (callbacks.on_close)();
                             }
                         })),
+                        open_url_external: open_url_external_for_map.clone(),
                         clipboard_context,
                     },
                 );
@@ -1514,6 +1569,8 @@ pub fn create_terminal(
     // Mouse buttons (also handles click-to-focus) — skip right-click (handled below)
     {
         let surface_cell = surface_cell.clone();
+        let open_url_external_for_press = open_url_external.clone();
+        let open_url_external_for_release = open_url_external.clone();
         let click = gtk::GestureClick::new();
         click.set_button(0); // all buttons
         let sc = surface_cell.clone();
@@ -1536,7 +1593,9 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
+                    open_url_external_for_press.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, button, mods);
+                    open_url_external_for_press.set(false);
                 }
             }
         });
@@ -1555,7 +1614,9 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
+                    open_url_external_for_release.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, button, mods);
+                    open_url_external_for_release.set(false);
                 }
             }
         });
@@ -1567,11 +1628,12 @@ pub fn create_terminal(
         let sc = surface_cell.clone();
         let callbacks = callbacks.clone();
         let gl = gl_area.clone();
+        let overlay = overlay.clone();
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
             let surface = *sc.borrow();
-            show_terminal_context_menu(&gl, surface, &callbacks, x, y);
+            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
         gl_area.add_controller(right_click);
@@ -1753,8 +1815,16 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     }
 }
 
+fn copy_text_to_clipboards(text: &str) {
+    if let Some(display) = gtk::gdk::Display::default() {
+        display.clipboard().set_text(text);
+        display.primary_clipboard().set_text(text);
+    }
+}
+
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
+    overlay: &gtk::Overlay,
     surface: Option<ghostty_surface_t>,
     callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
@@ -1774,6 +1844,8 @@ fn show_terminal_context_menu(
         ("Copy", has_selection),
         ("Paste", true),
         ("---", false),
+        ("IDs", true),
+        ("---", false),
         ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
@@ -1781,6 +1853,29 @@ fn show_terminal_context_menu(
         ("---", false),
         ("Clear", true),
     ];
+
+    let identity = (callbacks.borrow().identity)();
+    let ids_popover = gtk::Popover::new();
+    ids_popover.set_has_arrow(false);
+    ids_popover.set_position(gtk::PositionType::Right);
+    let ids_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    ids_box.set_margin_top(4);
+    ids_box.set_margin_bottom(4);
+    ids_box.set_margin_start(4);
+    ids_box.set_margin_end(4);
+    let copy_workspace_btn = gtk::Button::with_label("Copy Workspace ID");
+    copy_workspace_btn.add_css_class("flat");
+    copy_workspace_btn.set_sensitive(identity.workspace_id.is_some());
+    let copy_surface_btn = gtk::Button::with_label("Copy Surface ID");
+    copy_surface_btn.add_css_class("flat");
+    for btn in [&copy_workspace_btn, &copy_surface_btn] {
+        btn.set_halign(gtk::Align::Fill);
+        if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            lbl.set_xalign(0.0);
+        }
+        ids_box.append(btn);
+    }
+    ids_popover.set_child(Some(&ids_box));
 
     for (label, enabled) in &items {
         if *label == "---" {
@@ -1791,12 +1886,25 @@ fn show_terminal_context_menu(
             continue;
         }
 
-        let btn = gtk::Button::with_label(label);
+        let btn = gtk::Button::with_label(if *label == "IDs" { "IDs >" } else { label });
         btn.add_css_class("flat");
         btn.set_sensitive(*enabled);
         btn.set_halign(gtk::Align::Fill);
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
             lbl.set_xalign(0.0);
+        }
+        if *label == "IDs" {
+            ids_popover.set_parent(&btn);
+            let ids_popover_for_motion = ids_popover.clone();
+            let motion = gtk::EventControllerMotion::new();
+            motion.connect_enter(move |_, _, _| {
+                ids_popover_for_motion.popup();
+            });
+            btn.add_controller(motion);
+            let ids_popover_for_click = ids_popover.clone();
+            btn.connect_clicked(move |_| {
+                ids_popover_for_click.popup();
+            });
         }
         menu_box.append(&btn);
     }
@@ -1817,6 +1925,9 @@ fn show_terminal_context_menu(
             let gl_area = gl_area.clone();
 
             btn.connect_clicked(move |_| {
+                if label == "IDs >" {
+                    return;
+                }
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
@@ -1850,7 +1961,37 @@ fn show_terminal_context_menu(
     }
 
     {
+        let pop = popover.clone();
+        let ids_pop = ids_popover.clone();
+        let overlay = overlay.clone();
+        let workspace_id = identity.workspace_id.clone();
+        copy_workspace_btn.connect_clicked(move |_| {
+            if let Some(workspace_id) = workspace_id.as_deref() {
+                copy_text_to_clipboards(workspace_id);
+                show_clipboard_toast(&overlay);
+            }
+            ids_pop.popdown();
+            pop.popdown();
+        });
+    }
+
+    {
+        let pop = popover.clone();
+        let ids_pop = ids_popover.clone();
+        let overlay = overlay.clone();
+        let surface_id = identity.surface_id.clone();
+        copy_surface_btn.connect_clicked(move |_| {
+            copy_text_to_clipboards(&surface_id);
+            show_clipboard_toast(&overlay);
+            ids_pop.popdown();
+            pop.popdown();
+        });
+    }
+
+    {
+        let ids_popover = ids_popover.clone();
         popover.connect_closed(move |p| {
+            ids_popover.popdown();
             p.unparent();
         });
     }
@@ -2135,6 +2276,32 @@ mod tests {
         assert_eq!(terminal_search_action(""), "search:");
         assert_eq!(terminal_search_action("needle"), "search:needle");
         assert_eq!(terminal_search_action("two words"), "search:two words");
+    }
+
+    #[test]
+    fn open_url_action_uses_explicit_byte_len() {
+        let url = b"https://example.com/path?x=1";
+        let action = ghostty_action_open_url_s {
+            kind: 0,
+            url: url.as_ptr().cast(),
+            len: url.len(),
+        };
+
+        assert_eq!(
+            ghostty_open_url_to_string(action).as_deref(),
+            Some("https://example.com/path?x=1")
+        );
+    }
+
+    #[test]
+    fn open_url_action_rejects_empty_payload() {
+        let action = ghostty_action_open_url_s {
+            kind: 0,
+            url: ptr::null(),
+            len: 0,
+        };
+
+        assert_eq!(ghostty_open_url_to_string(action), None);
     }
 
     #[test]

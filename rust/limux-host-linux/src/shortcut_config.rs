@@ -1702,7 +1702,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 47);
+        assert_eq!(definitions().len(), 48);
     }
 
     #[test]

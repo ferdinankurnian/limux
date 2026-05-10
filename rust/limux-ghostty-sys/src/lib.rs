@@ -82,6 +82,7 @@ pub const GHOSTTY_ACTION_RELOAD_CONFIG: c_int = 46;
 pub const GHOSTTY_ACTION_CONFIG_CHANGE: c_int = 47;
 pub const GHOSTTY_ACTION_CLOSE_WINDOW: c_int = 48;
 pub const GHOSTTY_ACTION_RING_BELL: c_int = 49;
+pub const GHOSTTY_ACTION_OPEN_URL: c_int = 53;
 pub const GHOSTTY_ACTION_SHOW_CHILD_EXITED: c_int = 54;
 
 // Key codes (W3C UIEvents, subset)
@@ -324,6 +325,7 @@ pub union ghostty_action_u {
     pub desktop_notification: ghostty_action_desktop_notification_s,
     pub set_title: ghostty_action_set_title_s,
     pub pwd: ghostty_action_pwd_s,
+    pub open_url: ghostty_action_open_url_s,
     pub child_exited: ghostty_surface_message_childexited_s,
     _padding: [u8; 24],
 }
@@ -353,6 +355,14 @@ pub struct ghostty_action_set_title_s {
 #[derive(Clone, Copy)]
 pub struct ghostty_action_pwd_s {
     pub pwd: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_action_open_url_s {
+    pub kind: c_int,
+    pub url: *const c_char,
+    pub len: usize,
 }
 
 #[repr(C)]
