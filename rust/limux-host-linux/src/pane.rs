@@ -1180,7 +1180,7 @@ fn add_terminal_tab_inner(
         },
         term_callbacks,
     );
-    let widget: gtk::Widget = term.overlay.clone().upcast();
+    let widget = term.root.clone();
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
     {
