@@ -13,21 +13,19 @@ Limux has **two control servers**:
    `system.ping`, `system.identify`, `workspace.{current,list,create,
    select,rename,close}`, `pane.list`, `pane.surfaces`, `surface.list`,
    `pane.create` for terminal self-spawn, `surface.send_text`,
-   `surface.send_key`, and `notification.create`. It still does **NOT**
-   support `surface.read_text` or any browser commands.
+   `surface.send_key`, `surface.read_text`, `surface.health`, and
+   `notification.create`. It still does **NOT** support browser commands.
 
 When the GUI is running, the CLI targets the bridge via the runtime
 socket. `list-panes` / `list-panels`, terminal `new-pane --command ...`,
-text injection, and key-level injection now work against the running host.
-`read-screen` still errors out — that remains the main blocker for richer
-Codex↔Claude review loops where one agent needs to inspect another agent's
-screen programmatically.
+text injection, key-level injection, `surface-health`, and terminal
+`read-screen` now work against the running host.
 
 ## Delivery strategy (revised)
 
 ### Phase 1 — Env auto-wiring ✅ (shipped in 1295d12)
 
-### Phase 2 — Make the bridge a full proxy (🚧 PARTIAL — still the critical path)
+### Phase 2 — Make the bridge a full proxy (🚧 PARTIAL)
 
 Bridge should route unknown methods to a local `Dispatcher` instance
 seeded with live GTK state, OR to dedicated per-method `ControlCommand`
@@ -40,8 +38,9 @@ variants that interrogate the live state. The cleanest path:
 - Specific methods that need GTK side-effects (send_text, create_surface,
   notification.create) remain as `ControlCommand` variants.
 
-Remaining work unblocks `surface.read_text` against the live GUI — i.e. the
-last missing piece for agents to read each other's screens.
+The terminal introspection path is now bridged directly against live GTK state.
+Remaining proxy work is for deferred browser surface commands and broader
+dispatcher parity.
 
 **Shipped so far (in 6b8eb1a and follow-up bridge work):**
 
@@ -54,6 +53,8 @@ last missing piece for agents to read each other's screens.
   Limux window.
 - `surface.send_key` now routes to the exact terminal surface when provided,
   so agents can send deterministic key-level control such as Ctrl-C.
+- `surface.health` and `surface.read_text` now route on the live GTK bridge,
+  so agents can inspect peer terminal health and visible screen text.
 - `pane.create` now routes through the GTK bridge for terminal panes. From
   inside an agent terminal, `limux new-pane --direction right --command claude`
   uses `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and `LIMUX_PANE_ID` to split
@@ -61,11 +62,7 @@ last missing piece for agents to read each other's screens.
 
 **Still open (priority order):**
 
-- `surface.read_text` — letting an agent read a peer's scrollback /
-  current output (biggest unlock for real Codex↔Claude review loops)
-
-This is the last blocker before Codex can ask Claude "what's on your screen?"
-programmatically — everything else on the roadmap is polish.
+- Browser command bridge parity.
 
 ### Phase 3 — `limux notify` + GUI toast/sidebar integration ✅
 `ControlCommand::CreateNotification` wired through the bridge into

@@ -53,6 +53,15 @@ pub const GHOSTTY_SURFACE_CONTEXT_WINDOW: c_int = 0;
 pub const GHOSTTY_SURFACE_CONTEXT_TAB: c_int = 1;
 pub const GHOSTTY_SURFACE_CONTEXT_SPLIT: c_int = 2;
 
+pub const GHOSTTY_POINT_ACTIVE: c_int = 0;
+pub const GHOSTTY_POINT_VIEWPORT: c_int = 1;
+pub const GHOSTTY_POINT_SCREEN: c_int = 2;
+pub const GHOSTTY_POINT_SURFACE: c_int = 3;
+
+pub const GHOSTTY_POINT_COORD_EXACT: c_int = 0;
+pub const GHOSTTY_POINT_COORD_TOP_LEFT: c_int = 1;
+pub const GHOSTTY_POINT_COORD_BOTTOM_RIGHT: c_int = 2;
+
 pub const GHOSTTY_COLOR_SCHEME_LIGHT: c_int = 0;
 pub const GHOSTTY_COLOR_SCHEME_DARK: c_int = 1;
 
@@ -252,6 +261,23 @@ pub struct ghostty_surface_size_s {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_point_s {
+    pub tag: c_int,   // ghostty_point_tag_e
+    pub coord: c_int, // ghostty_point_coord_e
+    pub x: u32,
+    pub y: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_selection_s {
+    pub top_left: ghostty_point_s,
+    pub bottom_right: ghostty_point_s,
+    pub rectangle: bool,
+}
+
+#[repr(C)]
 pub struct ghostty_clipboard_content_s {
     pub mime: *const c_char,
     pub data: *const c_char,
@@ -416,6 +442,7 @@ extern "C" {
     pub fn ghostty_surface_set_focus(surface: ghostty_surface_t, focused: bool);
     pub fn ghostty_surface_set_size(surface: ghostty_surface_t, width: u32, height: u32);
     pub fn ghostty_surface_size(surface: ghostty_surface_t) -> ghostty_surface_size_s;
+    pub fn ghostty_surface_process_exited(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_key(surface: ghostty_surface_t, event: ghostty_input_key_s) -> bool;
     pub fn ghostty_surface_text(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_preedit(surface: ghostty_surface_t, text: *const c_char, len: usize);
@@ -447,6 +474,11 @@ extern "C" {
     pub fn ghostty_surface_has_selection(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_read_selection(
         surface: ghostty_surface_t,
+        text: *mut ghostty_text_s,
+    ) -> bool;
+    pub fn ghostty_surface_read_text(
+        surface: ghostty_surface_t,
+        selection: ghostty_selection_s,
         text: *mut ghostty_text_s,
     ) -> bool;
     pub fn ghostty_surface_free_text(surface: ghostty_surface_t, text: *mut ghostty_text_s);

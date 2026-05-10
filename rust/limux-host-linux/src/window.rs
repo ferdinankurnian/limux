@@ -613,6 +613,107 @@ fn surface_list_payload(
     serde_json::json!({ "surfaces": surfaces })
 }
 
+fn surface_health_row(
+    state: &State,
+    workspace: &Workspace,
+    index: usize,
+    surface: pane::SurfaceSummary,
+) -> serde_json::Value {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let mut row = serde_json::Map::new();
+    row.insert("index".to_string(), serde_json::json!(index));
+    row.insert(
+        "id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    row.insert(
+        "ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    row.insert(
+        "surface_id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    row.insert(
+        "surface_ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    row.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(surface.pane_id.to_string()),
+    );
+    row.insert(
+        "pane_ref".to_string(),
+        serde_json::Value::String(pane_ref(surface.pane_id)),
+    );
+    row.insert(
+        "type".to_string(),
+        serde_json::Value::String(surface.kind.clone()),
+    );
+    let focused = focused_surface_id.as_deref() == Some(surface.surface_id.as_str());
+    row.insert("focused".to_string(), serde_json::Value::Bool(focused));
+    row.insert(
+        "selected".to_string(),
+        serde_json::Value::Bool(surface.selected),
+    );
+    row.insert("in_window".to_string(), serde_json::Value::Bool(true));
+    row.insert("hidden".to_string(), serde_json::Value::Bool(false));
+
+    if surface.kind == "terminal" {
+        if let Some((_surface_id, handle)) =
+            pane::terminal_handle_for_root(&workspace.root, Some(&surface.surface_id))
+        {
+            let health = handle.health();
+            row.insert(
+                "healthy".to_string(),
+                serde_json::Value::Bool(health.realized && !health.process_exited),
+            );
+            row.insert(
+                "realized".to_string(),
+                serde_json::Value::Bool(health.realized),
+            );
+            row.insert(
+                "process_exited".to_string(),
+                serde_json::Value::Bool(health.process_exited),
+            );
+            row.insert("columns".to_string(), serde_json::json!(health.columns));
+            row.insert("rows".to_string(), serde_json::json!(health.rows));
+            row.insert("width_px".to_string(), serde_json::json!(health.width_px));
+            row.insert("height_px".to_string(), serde_json::json!(health.height_px));
+        } else {
+            row.insert("healthy".to_string(), serde_json::Value::Bool(false));
+            row.insert("realized".to_string(), serde_json::Value::Bool(false));
+            row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+        }
+    } else {
+        row.insert("healthy".to_string(), serde_json::Value::Bool(true));
+        row.insert("realized".to_string(), serde_json::Value::Bool(true));
+        row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+    }
+
+    serde_json::Value::Object(row)
+}
+
+fn surface_health_payload(
+    state: &State,
+    workspace: &Workspace,
+    surface_hint: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let requested = surface_hint.map(normalize_surface_handle);
+    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .enumerate()
+        .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
+        .collect::<Vec<_>>();
+
+    if surface_hint.is_some() && surfaces.is_empty() {
+        return Err(BridgeError::not_found("surface not found"));
+    }
+
+    Ok(serde_json::json!({ "surfaces": surfaces }))
+}
+
 #[derive(Clone)]
 struct WorkspaceSeedSource {
     workspace_cwd: Option<String>,
@@ -3873,6 +3974,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::SurfaceHealth {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                surface_health_payload(state, &app_state.workspaces[index], surface_hint.as_deref())
+            };
+            let _ = reply.send(result);
+        }
         ControlCommand::CreateWorkspace {
             name,
             cwd,
@@ -4045,7 +4169,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let target = {
                 let app_state = state.borrow();
                 let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                let (_focused_pane_id, focused_surface_id) =
+                    focused_ids_for_workspace(state, &workspace.id);
+                let resolved_surface_hint =
+                    surface_hint.as_deref().or(focused_surface_id.as_deref());
+                pane::terminal_handle_for_root(&workspace.root, resolved_surface_hint).map(
                     |(surface_id, handle)| {
                         (
                             serde_json::json!({
@@ -4070,6 +4198,59 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             handle.send_text(&text);
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::ReadSurfaceText {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            let Some(text) = handle.read_viewport_text() else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
+                    "surface.read_text failed",
+                )));
+                return;
+            };
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("text".to_string(), serde_json::Value::String(text));
             }
             let _ = reply.send(Ok(payload));
         }

@@ -29,6 +29,8 @@ const METHODS: &[&str] = &[
     "pane.surfaces",
     "pane.create",
     "surface.list",
+    "surface.health",
+    "surface.read_text",
     "surface.send_text",
     "surface.send_key",
     "notification.create",
@@ -124,6 +126,16 @@ pub enum ControlCommand {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfaceHealth {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ReadSurfaceText {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CreateWorkspace {
         name: Option<String>,
         cwd: Option<String>,
@@ -177,6 +189,8 @@ impl ControlCommand {
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
             | Self::ListSurfaces { reply, .. }
+            | Self::SurfaceHealth { reply, .. }
+            | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
@@ -493,6 +507,46 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListSurfaces { target, reply }, rx)
+        }
+        "surface.health" | "surface-health" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(params, &["surface_id", "id"], "surface:")
+            {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceHealth {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.read_text" | "read-screen" | "capture-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(params, &["surface_id", "id"], "surface:")
+            {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ReadSurfaceText {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
         }
         "workspace.create" | "new-workspace" => {
             let (reply, rx) = mpsc::channel();
@@ -918,5 +972,49 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn surface_health_route_accepts_surface_refs() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.health","params":{"workspace_id":"codex","surface_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceHealth {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "surfaces": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn read_text_route_accepts_capture_alias_and_surface_refs() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"capture-pane","params":{"surface_id":"surface:9:tab"}}"#,
+            &|command| match command {
+                ControlCommand::ReadSurfaceText {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Active);
+                    assert_eq!(surface_hint, Some("9:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "text": "ready" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("result")["text"], "ready");
     }
 }

@@ -162,6 +162,16 @@ pub struct TerminalHandle {
     callbacks: Rc<RefCell<TerminalCallbacks>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalHealth {
+    pub realized: bool,
+    pub process_exited: bool,
+    pub columns: u16,
+    pub rows: u16,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
 impl TerminalHandle {
     pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
         *self.callbacks.borrow_mut() = callbacks;
@@ -228,6 +238,62 @@ impl TerminalHandle {
         true
     }
 
+    pub fn health(&self) -> TerminalHealth {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return TerminalHealth {
+                realized: false,
+                process_exited: false,
+                columns: 0,
+                rows: 0,
+                width_px: 0,
+                height_px: 0,
+            };
+        };
+
+        let size = unsafe { ghostty_surface_size(surface) };
+        TerminalHealth {
+            realized: true,
+            process_exited: unsafe { ghostty_surface_process_exited(surface) },
+            columns: size.columns,
+            rows: size.rows,
+            width_px: size.width_px,
+            height_px: size.height_px,
+        }
+    }
+
+    pub fn read_viewport_text(&self) -> Option<String> {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return Some(String::new());
+        };
+
+        let selection = ghostty_selection_s {
+            top_left: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                x: 0,
+                y: 0,
+            },
+            bottom_right: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                x: 0,
+                y: 0,
+            },
+            rectangle: false,
+        };
+        let mut text = empty_ghostty_text();
+
+        let has_text = unsafe { ghostty_surface_read_text(surface, selection, &mut text) };
+        if !has_text || text.text.is_null() {
+            return Some(String::new());
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let output = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { ghostty_surface_free_text(surface, &mut text) };
+        Some(output)
+    }
+
     pub fn show_find(&self) -> bool {
         self.search_bar.set_search_mode(true);
         self.search_entry.grab_focus();
@@ -287,17 +353,10 @@ impl TerminalHandle {
             return String::new();
         };
 
-        let mut text = ghostty_text_s {
-            tl_px_x: 0.0,
-            tl_px_y: 0.0,
-            offset_start: 0,
-            offset_len: 0,
-            text: ptr::null(),
-            text_len: 0,
-        };
+        let mut text = empty_ghostty_text();
 
         let has_selection = unsafe { ghostty_surface_read_selection(surface, &mut text) };
-        if !has_selection || text.text.is_null() || text.text_len == 0 {
+        if !has_selection || text.text.is_null() {
             return String::new();
         }
 
@@ -305,6 +364,17 @@ impl TerminalHandle {
         let selection = String::from_utf8_lossy(bytes).into_owned();
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         selection
+    }
+}
+
+fn empty_ghostty_text() -> ghostty_text_s {
+    ghostty_text_s {
+        tl_px_x: 0.0,
+        tl_px_y: 0.0,
+        offset_start: 0,
+        offset_len: 0,
+        text: ptr::null(),
+        text_len: 0,
     }
 }
 
