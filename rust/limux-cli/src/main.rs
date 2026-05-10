@@ -1352,13 +1352,7 @@ fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
                 .map(|agent| vec![agent])
         })
         .transpose()?
-        .unwrap_or_else(|| {
-            vec![
-                agent_hooks::AgentKind::Codex,
-                agent_hooks::AgentKind::Claude,
-                agent_hooks::AgentKind::OpenCode,
-            ]
-        });
+        .unwrap_or_else(default_hook_targets);
 
     let mut installed = Vec::new();
     for agent in agents {
@@ -1376,13 +1370,7 @@ fn uninstall_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
                 .map(|agent| vec![agent])
         })
         .transpose()?
-        .unwrap_or_else(|| {
-            vec![
-                agent_hooks::AgentKind::Codex,
-                agent_hooks::AgentKind::Claude,
-                agent_hooks::AgentKind::OpenCode,
-            ]
-        });
+        .unwrap_or_else(default_hook_targets);
 
     let mut changed = Vec::new();
     for agent in agents {
@@ -1390,6 +1378,14 @@ fn uninstall_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
         changed.push(agent.store_name().to_string());
     }
     Ok(changed)
+}
+
+fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
+    vec![
+        agent_hooks::AgentKind::Codex,
+        agent_hooks::AgentKind::Claude,
+        agent_hooks::AgentKind::Gemini,
+    ]
 }
 
 fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
@@ -3644,6 +3640,19 @@ mod cli_arg_tests {
             agent_hook_persistence_action("restore-exit"),
             AgentHookPersistenceAction::Remove
         );
+    }
+
+    #[test]
+    fn default_hook_setup_omits_opencode_until_supported() {
+        assert_eq!(
+            default_hook_targets(),
+            vec![
+                agent_hooks::AgentKind::Codex,
+                agent_hooks::AgentKind::Claude,
+                agent_hooks::AgentKind::Gemini,
+            ]
+        );
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
     }
 
     #[test]
