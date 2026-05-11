@@ -3994,6 +3994,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     persist: true,
                 },
             );
+            let Some(new_pane) = new_pane else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "not enough room to split pane",
+                )));
+                return;
+            };
 
             let Some(surface) = pane::active_surface_summary(&new_pane) else {
                 let _ = reply.send(Err(BridgeError::internal(
@@ -4008,11 +4014,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             if let Some(command) = request.command {
                 send_pane_create_response_after_command(
-                    new_pane.upcast(),
-                    surface_id,
-                    command,
-                    response,
-                    reply,
+                    new_pane, surface_id, command, response, reply,
                 );
                 return;
             }
@@ -4986,7 +4988,7 @@ fn split_pane(
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
     options: SplitPaneOptions,
-) -> gtk::Widget {
+) -> Option<gtk::Widget> {
     let (shortcuts, wd, container) = {
         let s = state.borrow();
         (
@@ -5001,9 +5003,10 @@ fn split_pane(
                 .map(|ws| ws.split_container.clone()),
         )
     };
-    let Some(container) = container else {
-        return pane_widget.clone();
-    };
+    let container = container?;
+    if !container.can_split(pane_widget, orientation) {
+        return None;
+    }
 
     let new_pane = create_pane_for_workspace(
         state,
@@ -5017,17 +5020,19 @@ fn split_pane(
     // Mutate the data model and trigger async widget tree rebuild.
     // The existing pane's GLArea will be unrealized then re-realized
     // on separate ticks, avoiding the GTK4 GLArea breakage.
-    container.split(
+    if !container.split(
         pane_widget,
         new_pane.clone().upcast(),
         orientation,
         options.new_pane_first,
         layout_state::DEFAULT_SPLIT_RATIO,
-    );
+    ) {
+        return None;
+    }
     if options.persist {
         request_session_save(state);
     }
-    new_pane.upcast()
+    Some(new_pane.upcast())
 }
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
@@ -5083,6 +5088,7 @@ fn handle_split_with_tab(
             persist: false,
         },
     );
+    let Some(new_pane) = new_pane else { return };
     if pane::move_tab_to_pane(source_pane, tab_id, &new_pane) {
         request_session_save(state);
     }
@@ -5275,7 +5281,7 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
             let Some((ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
                 return false;
             };
-            let _ = split_pane(
+            split_pane(
                 state,
                 &ws_id,
                 &pane_widget,
@@ -5286,8 +5292,8 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
                     new_pane_first: false,
                     persist: true,
                 },
-            );
-            true
+            )
+            .is_some()
         }
         _ => false,
     }

@@ -188,8 +188,18 @@ impl TerminalHandle {
     }
 
     pub fn focus_surface(&self) -> bool {
+        self.refresh_display();
         self.gl_area.grab_focus();
         true
+    }
+
+    pub fn refresh_display(&self) {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            self.gl_area.queue_render();
+            return;
+        };
+
+        refresh_realized_surface_display(surface, &self.gl_area);
     }
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
@@ -400,6 +410,31 @@ fn terminal_search_action(query: &str) -> String {
 fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     had_focus.set(true);
     gl_area.grab_focus();
+}
+
+fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+    let alloc = gl_area.allocation();
+    let w = alloc.width() as u32;
+    let h = alloc.height() as u32;
+    if w > 0 && h > 0 {
+        let scale = gl_area.scale_factor() as f64;
+        unsafe {
+            ghostty_surface_set_content_scale(surface, scale, scale);
+            ghostty_surface_set_size(surface, w, h);
+        }
+    }
+    unsafe { ghostty_surface_refresh(surface) };
+    gl_area.queue_render();
+}
+
+fn refresh_realized_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+    if gl_area.is_realized() {
+        gl_area.make_current();
+        if gl_area.error().is_none() {
+            unsafe { ghostty_surface_display_realized(surface) };
+        }
+    }
+    refresh_surface_display(surface, gl_area);
 }
 
 fn clear_ghostty_preedit(surface: ghostty_surface_t) {
@@ -1099,10 +1134,6 @@ pub fn create_terminal(
     gl_area.set_auto_render(true);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
-    gl_area.connect_map(|gl_area| {
-        gl_area.queue_render();
-    });
-
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
@@ -1160,6 +1191,17 @@ pub fn create_terminal(
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
     };
+
+    {
+        let surface_cell = surface_cell.clone();
+        gl_area.connect_map(move |gl_area| {
+            if let Some(surface) = *surface_cell.borrow() {
+                refresh_realized_surface_display(surface, gl_area);
+            } else {
+                gl_area.queue_render();
+            }
+        });
+    }
 
     {
         let handle = handle.clone();
@@ -1248,8 +1290,11 @@ pub fn create_terminal(
             // reinitialize the GL renderer with the new GL context while
             // preserving the terminal/pty state.
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_display_realized(surface) };
-                gl_area.queue_render();
+                refresh_realized_surface_display(surface, gl_area);
+                let gl_area = gl_area.clone();
+                glib::idle_add_local_once(move || {
+                    gl_area.queue_render();
+                });
                 return;
             }
 
@@ -1341,10 +1386,7 @@ pub fn create_terminal(
             let w = alloc.width() as u32;
             let h = alloc.height() as u32;
             if w > 0 && h > 0 {
-                unsafe {
-                    ghostty_surface_set_content_scale(surface, scale, scale);
-                    ghostty_surface_set_size(surface, w, h);
-                }
+                refresh_surface_display(surface, gl_area);
             }
 
             let surface_key = surface as usize;
@@ -1441,12 +1483,7 @@ pub fn create_terminal(
                 let w = width as u32;
                 let h = height as u32;
                 if w > 0 && h > 0 {
-                    let scale = gl_area.scale_factor() as f64;
-                    unsafe {
-                        ghostty_surface_set_content_scale(surface, scale, scale);
-                        ghostty_surface_set_size(surface, w, h);
-                    }
-                    gl_area.queue_render();
+                    refresh_surface_display(surface, gl_area);
                 }
             }
 

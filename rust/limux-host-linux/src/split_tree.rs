@@ -221,6 +221,10 @@ impl SplitTreeContainer {
     }
 
     /// Split a pane. Mutates the data model, then triggers async rebuild.
+    pub(crate) fn can_split(&self, target: &gtk::Widget, orientation: gtk::Orientation) -> bool {
+        pane_has_room_to_split(target, orientation)
+    }
+
     pub(crate) fn split(
         self: &Rc<Self>,
         target: &gtk::Widget,
@@ -228,7 +232,11 @@ impl SplitTreeContainer {
         orientation: gtk::Orientation,
         new_pane_first: bool,
         ratio: f64,
-    ) {
+    ) -> bool {
+        if !pane_has_room_to_split(target, orientation) {
+            return false;
+        }
+
         self.save_focus();
         self.zoomed_pane.borrow_mut().take();
         *self.last_focused.borrow_mut() = Some(new_pane.clone());
@@ -266,6 +274,7 @@ impl SplitTreeContainer {
         if replaced {
             self.trigger_rebuild();
         }
+        replaced
     }
 
     /// Remove a pane. Mutates the data model, then triggers async rebuild.
@@ -318,20 +327,29 @@ impl SplitTreeContainer {
     }
 
     /// Build new widget tree from data model, attach atomically.
-    fn do_rebuild(&self) {
+    fn do_rebuild(self: &Rc<Self>) {
         // Pane widgets may still be parented to old (floating) Paneds from
         // the previous tree. GTK4 won't let us add them to new containers
         // until they're unparented. Detach them all first.
         let tree = self.tree.borrow();
         let zoomed = self.zoomed_pane.borrow().clone();
         if let Some(pane) = zoomed {
-            detach_pane_from_old_parent(&pane);
+            if pane.parent().is_some() {
+                detach_pane_from_old_parent(&pane);
+                self.schedule_rebuild();
+                return;
+            }
             self.bin.append(&pane);
         } else {
-            detach_panes_from_old_tree(&tree);
+            if tree_has_pane_parents(&tree) {
+                detach_panes_from_old_tree(&tree);
+                self.schedule_rebuild();
+                return;
+            }
             let widget = build_widget_tree(&tree, &self.state);
             self.bin.append(&widget);
         }
+        refresh_terminal_displays_after_rebuild(self.bin.upcast_ref());
 
         // Newly created panes are tracked as pane containers rather than the
         // inner terminal/browser widget, so restore through the pane helper
@@ -393,6 +411,15 @@ fn detach_panes_from_old_tree(node: &SplitNode) {
     }
 }
 
+fn tree_has_pane_parents(node: &SplitNode) -> bool {
+    match node {
+        SplitNode::Leaf { pane_widget } => pane_widget.parent().is_some(),
+        SplitNode::Split { left, right, .. } => {
+            tree_has_pane_parents(left) || tree_has_pane_parents(right)
+        }
+    }
+}
+
 fn detach_pane_from_old_parent(pane_widget: &gtk::Widget) {
     if let Some(parent) = pane_widget.parent() {
         if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
@@ -426,6 +453,10 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .hexpand(true)
                 .vexpand(true)
                 .build();
+            paned.set_shrink_start_child(false);
+            paned.set_shrink_end_child(false);
+            paned.set_resize_start_child(true);
+            paned.set_resize_end_child(true);
 
             let ratio_val = *ratio.borrow();
             update_split_ratio_state(&paned, ratio_val);
@@ -468,6 +499,47 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             paned.upcast()
         }
     }
+}
+
+fn pane_has_room_to_split(target: &gtk::Widget, orientation: gtk::Orientation) -> bool {
+    let allocation = target.allocation();
+    let size = if orientation == gtk::Orientation::Horizontal {
+        allocation.width()
+    } else {
+        allocation.height()
+    };
+    size <= 0 || split_extent_has_room(size, orientation)
+}
+
+fn minimum_split_extent(orientation: gtk::Orientation) -> i32 {
+    if orientation == gtk::Orientation::Horizontal {
+        pane::MIN_PANE_WIDTH
+    } else {
+        pane::MIN_PANE_HEIGHT
+    }
+}
+
+fn split_extent_has_room(size: i32, orientation: gtk::Orientation) -> bool {
+    size >= minimum_split_extent(orientation) * 2
+}
+
+fn refresh_terminal_displays_after_rebuild(root: &gtk::Widget) {
+    pane::refresh_terminal_displays_in_root(root);
+
+    let idle_root = root.clone();
+    glib::idle_add_local_once(move || {
+        pane::refresh_terminal_displays_in_root(&idle_root);
+    });
+
+    let first_frame_root = root.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+        pane::refresh_terminal_displays_in_root(&first_frame_root);
+    });
+
+    let settled_root = root.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+        pane::refresh_terminal_displays_in_root(&settled_root);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -522,5 +594,30 @@ pub(crate) fn build_split_node_from_layout(
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_extent_requires_room_for_both_children() {
+        assert!(!split_extent_has_room(
+            pane::MIN_PANE_WIDTH * 2 - 1,
+            gtk::Orientation::Horizontal
+        ));
+        assert!(split_extent_has_room(
+            pane::MIN_PANE_WIDTH * 2,
+            gtk::Orientation::Horizontal
+        ));
+        assert!(!split_extent_has_room(
+            pane::MIN_PANE_HEIGHT * 2 - 1,
+            gtk::Orientation::Vertical
+        ));
+        assert!(split_extent_has_room(
+            pane::MIN_PANE_HEIGHT * 2,
+            gtk::Orientation::Vertical
+        ));
     }
 }

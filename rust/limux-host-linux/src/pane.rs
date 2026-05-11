@@ -93,6 +93,8 @@ const BROWSER_SEARCH_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS];
 #[cfg(feature = "webkit")]
 const BROWSER_WEB_VIEW_CSS_CLASS: &str = "limux-browser-web-view";
+pub(crate) const MIN_PANE_WIDTH: i32 = 260;
+pub(crate) const MIN_PANE_HEIGHT: i32 = 160;
 
 pub fn is_tab_dragging() -> bool {
     TAB_DRAGGING.with(|value| value.get())
@@ -407,6 +409,7 @@ pub fn create_pane(
         .hexpand(true)
         .vexpand(true)
         .build();
+    outer.set_size_request(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
 
     // The single header line: tabs (left) + action icons (right)
     let header = gtk::Box::builder()
@@ -655,6 +658,16 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
         &tab_id,
     );
     true
+}
+
+pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
+    for internals in pane_internals_for_root(root) {
+        for entry in &internals.tab_state.borrow().tabs {
+            if let TabKind::Terminal { state } = &entry.kind {
+                state.handle.refresh_display();
+            }
+        }
+    }
 }
 
 pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
