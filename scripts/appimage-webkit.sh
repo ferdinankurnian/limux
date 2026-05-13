@@ -210,6 +210,11 @@ copy_appimage_webkit_runtime() {
         runtime_binaries+=("$entry")
     done < <(find "$runtime_dest" -type f \( -perm -0100 -o -name '*.so*' \) | sort)
 
-    copy_appimage_library_closure "$appdir/usr/lib" "$BINARY" "$GHOSTTY_SO" "${runtime_binaries[@]}"
+    copy_appimage_library_closure \
+        "$appdir/usr/lib" \
+        "$CLI_BINARY" \
+        "$HOST_BINARY" \
+        "$GHOSTTY_SO" \
+        "${runtime_binaries[@]}"
     patch_appimage_webkit_paths "$appdir"
 }
