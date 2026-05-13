@@ -873,6 +873,12 @@ fn suspend_persistence(state: &State, suspended: bool) {
     state.borrow_mut().persistence_suspended = suspended;
 }
 
+fn stop_session_saves_for_shutdown(state: &State) {
+    let mut s = state.borrow_mut();
+    s.save_queued = false;
+    s.persistence_suspended = true;
+}
+
 fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     suspend_persistence(state, true);
 
@@ -1689,6 +1695,7 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_close_request(move |_| {
             save_session_now(&state);
+            stop_session_saves_for_shutdown(&state);
             CONTROL_STATE.with(|slot| {
                 slot.borrow_mut().take();
             });
@@ -6199,6 +6206,20 @@ mod tests {
         );
 
         drop(borrow);
+        assert!(!state.borrow().save_queued);
+    }
+
+    #[test]
+    fn queue_session_save_request_ignores_suspended_persistence() {
+        let state = Rc::new(RefCell::new(TestSessionSaveState {
+            persistence_suspended: true,
+            save_queued: false,
+        }));
+
+        assert_eq!(
+            queue_session_save_request(&state),
+            SessionSaveRequest::Ignore
+        );
         assert!(!state.borrow().save_queued);
     }
 
