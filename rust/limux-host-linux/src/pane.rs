@@ -849,6 +849,14 @@ struct TabEntry {
     kind: TabKind,
 }
 
+impl TabEntry {
+    fn prepare_for_removal(&self) {
+        if let TabKind::Browser { state } = &self.kind {
+            state.handles.prepare_for_removal();
+        }
+    }
+}
+
 struct TabState {
     tabs: Vec<TabEntry>,
     active_tab: Option<String>,
@@ -2813,6 +2821,7 @@ fn remove_tab(
     };
     let entry = ts.tabs.remove(idx);
 
+    entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
 
@@ -2913,6 +2922,13 @@ impl BrowserShortcutTarget {
 
 #[cfg(feature = "webkit")]
 impl BrowserHandles {
+    fn prepare_for_removal(&self) {
+        self.find_controller.search_finish();
+        self.search_bar.set_search_mode(false);
+        self.dom_editable.set(false);
+        self.webview.stop_loading();
+    }
+
     fn is_find_active(&self) -> bool {
         self.search_bar.is_search_mode()
     }
@@ -3001,10 +3017,10 @@ impl BrowserHandles {
     }
 
     fn use_selection_for_find(&self) -> bool {
-        let search_entry = self.search_entry.clone();
-        let search_bar = self.search_bar.clone();
-        let find_controller = self.find_controller.clone();
-        let webview = self.webview.clone();
+        let search_entry = self.search_entry.downgrade();
+        let search_bar = self.search_bar.downgrade();
+        let find_controller = self.find_controller.downgrade();
+        let webview = self.webview.downgrade();
         self.webview.evaluate_javascript(
             "window.getSelection ? window.getSelection().toString() : '';",
             None,
@@ -3018,14 +3034,21 @@ impl BrowserHandles {
                 if selection.is_empty() {
                     return;
                 }
+                let Some(search_bar) = search_bar.upgrade() else {
+                    return;
+                };
+                let Some(search_entry) = search_entry.upgrade() else {
+                    return;
+                };
+                let Some(find_controller) = find_controller.upgrade() else {
+                    return;
+                };
+                let Some(webview) = webview.upgrade() else {
+                    return;
+                };
                 search_bar.set_search_mode(true);
                 search_entry.set_text(selection.as_str());
-                find_controller.search(
-                    selection.as_str(),
-                    webkit6::FindOptions::CASE_INSENSITIVE.bits()
-                        | webkit6::FindOptions::WRAP_AROUND.bits(),
-                    u32::MAX,
-                );
+                search_for_browser_text(&find_controller, selection.as_str());
                 search_entry.grab_focus();
                 search_entry.select_region(0, -1);
                 webview.queue_draw();
@@ -3035,22 +3058,27 @@ impl BrowserHandles {
     }
 
     fn search_for_entry_text(&self) {
-        let query = self.search_entry.text();
-        if query.is_empty() {
-            self.find_controller.search_finish();
-            return;
-        }
-        self.find_controller.search(
-            query.as_str(),
-            webkit6::FindOptions::CASE_INSENSITIVE.bits()
-                | webkit6::FindOptions::WRAP_AROUND.bits(),
-            u32::MAX,
-        );
+        search_for_browser_text(&self.find_controller, self.search_entry.text().as_str());
     }
+}
+
+#[cfg(feature = "webkit")]
+fn search_for_browser_text(find_controller: &webkit6::FindController, query: &str) {
+    if query.is_empty() {
+        find_controller.search_finish();
+        return;
+    }
+    find_controller.search(
+        query,
+        webkit6::FindOptions::CASE_INSENSITIVE.bits() | webkit6::FindOptions::WRAP_AROUND.bits(),
+        u32::MAX,
+    );
 }
 
 #[cfg(not(feature = "webkit"))]
 impl BrowserHandles {
+    fn prepare_for_removal(&self) {}
+
     fn is_find_active(&self) -> bool {
         false
     }
@@ -3296,32 +3324,40 @@ fn create_browser_widget(
     nav_bar.append(&url_entry);
 
     {
-        let wv = webview.clone();
+        let webview = webview.downgrade();
         back_btn.connect_clicked(move |_| {
-            wv.go_back();
+            if let Some(webview) = webview.upgrade() {
+                webview.go_back();
+            }
         });
     }
     {
-        let wv = webview.clone();
+        let webview = webview.downgrade();
         fwd_btn.connect_clicked(move |_| {
-            wv.go_forward();
+            if let Some(webview) = webview.upgrade() {
+                webview.go_forward();
+            }
         });
     }
     {
-        let wv = webview.clone();
+        let webview = webview.downgrade();
         reload_btn.connect_clicked(move |_| {
-            wv.reload();
+            if let Some(webview) = webview.upgrade() {
+                webview.reload();
+            }
         });
     }
     {
-        let wv = webview.clone();
+        let webview = webview.downgrade();
         url_entry.connect_activate(move |entry| {
-            let url = normalize_browser_entry_input(&entry.text());
-            wv.load_uri(&url);
+            if let Some(webview) = webview.upgrade() {
+                let url = normalize_browser_entry_input(&entry.text());
+                webview.load_uri(&url);
+            }
         });
     }
     {
-        let entry = url_entry.clone();
+        let entry = url_entry.downgrade();
         let saved_uri = saved_uri.clone();
         let callbacks = callbacks.clone();
         let restoring = Rc::new(std::cell::Cell::new(initial_uri.is_some()));
@@ -3329,7 +3365,9 @@ fn create_browser_widget(
         webview.connect_uri_notify(move |wv| {
             if let Some(uri) = wv.uri() {
                 let uri_str: String = uri.into();
-                entry.set_text(&uri_str);
+                if let Some(entry) = entry.upgrade() {
+                    entry.set_text(&uri_str);
+                }
                 if restoring_flag.get() && (uri_str.is_empty() || uri_str == "about:blank") {
                     return;
                 }
@@ -3355,13 +3393,19 @@ fn create_browser_widget(
     search_bar.connect_entry(&search_entry);
     search_bar.set_child(Some(&search_entry));
     {
-        let search_bar = search_bar.clone();
-        let find_controller = find_controller.clone();
-        let webview = webview.clone();
+        let search_bar = search_bar.downgrade();
+        let find_controller = find_controller.downgrade();
+        let webview = webview.downgrade();
         search_entry.connect_stop_search(move |_| {
-            find_controller.search_finish();
-            search_bar.set_search_mode(false);
-            webview.grab_focus();
+            if let Some(find_controller) = find_controller.upgrade() {
+                find_controller.search_finish();
+            }
+            if let Some(search_bar) = search_bar.upgrade() {
+                search_bar.set_search_mode(false);
+            }
+            if let Some(webview) = webview.upgrade() {
+                webview.grab_focus();
+            }
         });
     }
     {
@@ -3392,25 +3436,29 @@ fn create_browser_widget(
     };
 
     {
-        let browser_handles = browser_handles.clone();
-        search_entry.connect_search_changed(move |_| {
-            browser_handles.search_for_entry_text();
+        let find_controller = find_controller.downgrade();
+        search_entry.connect_search_changed(move |entry| {
+            if let Some(find_controller) = find_controller.upgrade() {
+                search_for_browser_text(&find_controller, entry.text().as_str());
+            }
         });
     }
 
     // Load default URL only on the first map. The WebView preserves its
     // page and history across reparenting (splits), so we must not reload.
     {
-        let wv = webview.clone();
+        let webview = webview.downgrade();
         let loaded = std::cell::Cell::new(false);
         let initial_uri = initial_uri.map(|value| value.to_string());
         vbox.connect_map(move |_| {
             if !loaded.get() {
                 loaded.set(true);
-                if let Some(uri) = &initial_uri {
-                    wv.load_uri(uri);
-                } else {
-                    wv.load_uri("https://google.com");
+                if let Some(webview) = webview.upgrade() {
+                    if let Some(uri) = &initial_uri {
+                        webview.load_uri(uri);
+                    } else {
+                        webview.load_uri("https://google.com");
+                    }
                 }
             }
         });
