@@ -412,15 +412,33 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     gl_area.grab_focus();
 }
 
+fn physical_size_for_allocation(
+    logical_width: i32,
+    logical_height: i32,
+    scale_factor: i32,
+) -> Option<(u32, u32, u32)> {
+    let logical_width = u32::try_from(logical_width).ok()?;
+    let logical_height = u32::try_from(logical_height).ok()?;
+    let scale_factor = u32::try_from(scale_factor).ok()?;
+
+    if logical_width == 0 || logical_height == 0 || scale_factor == 0 {
+        return None;
+    }
+
+    let physical_width = logical_width.checked_mul(scale_factor)?;
+    let physical_height = logical_height.checked_mul(scale_factor)?;
+    Some((physical_width, physical_height, scale_factor))
+}
+
 fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     let alloc = gl_area.allocation();
-    let w = alloc.width() as u32;
-    let h = alloc.height() as u32;
-    if w > 0 && h > 0 {
-        let scale = gl_area.scale_factor() as f64;
+    if let Some((width, height, scale_factor)) =
+        physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor())
+    {
+        let scale = scale_factor as f64;
         unsafe {
             ghostty_surface_set_content_scale(surface, scale, scale);
-            ghostty_surface_set_size(surface, w, h);
+            ghostty_surface_set_size(surface, width, height);
         }
     }
     unsafe { ghostty_surface_refresh(surface) };
@@ -1380,12 +1398,12 @@ pub fn create_terminal(
                 }
             }
 
-            // Set initial size — GLArea gives unscaled CSS pixels,
-            // Ghostty handles scaling internally via content_scale.
+            // Set initial size in physical pixels. GTK allocation is logical
+            // CSS pixels; Ghostty's GL renderer expects the backing FBO size.
             let alloc = gl_area.allocation();
-            let w = alloc.width() as u32;
-            let h = alloc.height() as u32;
-            if w > 0 && h > 0 {
+            if physical_size_for_allocation(alloc.width(), alloc.height(), gl_area.scale_factor())
+                .is_some()
+            {
                 refresh_surface_display(surface, gl_area);
             }
 
@@ -2278,6 +2296,32 @@ fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_size_matches_logical_allocation_times_scale_factor() {
+        assert_eq!(
+            physical_size_for_allocation(1280, 720, 1),
+            Some((1280, 720, 1))
+        );
+        assert_eq!(
+            physical_size_for_allocation(1280, 720, 2),
+            Some((2560, 1440, 2))
+        );
+        assert_eq!(
+            physical_size_for_allocation(640, 480, 3),
+            Some((1920, 1440, 3))
+        );
+    }
+
+    #[test]
+    fn physical_size_rejects_invalid_allocation_or_scale() {
+        assert_eq!(physical_size_for_allocation(0, 720, 2), None);
+        assert_eq!(physical_size_for_allocation(1280, 0, 2), None);
+        assert_eq!(physical_size_for_allocation(1280, 720, 0), None);
+        assert_eq!(physical_size_for_allocation(-1, 720, 2), None);
+        assert_eq!(physical_size_for_allocation(1280, -1, 2), None);
+        assert_eq!(physical_size_for_allocation(1280, 720, -1), None);
+    }
 
     #[test]
     fn maps_dark_mode_to_ghostty_color_scheme() {
