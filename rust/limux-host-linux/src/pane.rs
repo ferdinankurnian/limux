@@ -2961,28 +2961,37 @@ fn activate_tab(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
 ) {
-    let mut ts = tab_state.borrow_mut();
-    ts.active_tab = Some(tab_id.to_string());
+    let (focus_target, has_content_child) = {
+        let mut ts = tab_state.borrow_mut();
+        ts.active_tab = Some(tab_id.to_string());
 
-    // Update visual state on all tabs
-    for entry in &ts.tabs {
-        if entry.id == tab_id {
-            entry.tab_button.add_css_class("limux-tab-active");
-        } else {
-            entry.tab_button.remove_css_class("limux-tab-active");
+        // Update visual state on all tabs
+        for entry in &ts.tabs {
+            if entry.id == tab_id {
+                entry.tab_button.add_css_class("limux-tab-active");
+            } else {
+                entry.tab_button.remove_css_class("limux-tab-active");
+            }
         }
-    }
 
-    if content_stack.child_by_name(tab_id).is_some() {
+        let focus_target = ts
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+            .map(TabFocusTarget::from_entry);
+
+        (focus_target, content_stack.child_by_name(tab_id).is_some())
+        // `ts` (the RefCell borrow_mut guard) is dropped here, before we touch
+        // content_stack. set_visible_child_name() synchronously fires GTK
+        // unmap/map signals (hover-out on the old surface, etc.), and those
+        // handlers can re-enter tab_state.borrow() (e.g. tab_rename_active).
+        // Holding the mutable borrow across that call caused a double-borrow
+        // panic on rapid repeated tab switches (Ctrl+Tab x2-4 fast).
+    };
+
+    if has_content_child {
         content_stack.set_visible_child_name(tab_id);
     }
-
-    let focus_target = ts
-        .tabs
-        .iter()
-        .find(|entry| entry.id == tab_id)
-        .map(TabFocusTarget::from_entry);
-    drop(ts);
 
     if let Some(target) = focus_target {
         // Mouse-initiated tab switches can leave focus on the click target if we
