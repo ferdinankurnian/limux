@@ -87,7 +87,7 @@ pub(crate) struct AppState {
     sidebar_list: gtk::ListBox,
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
-    add_btn: gtk::MenuButton,
+    add_btn: gtk::Button,
     add_btn_popover: gtk::Popover,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
@@ -1241,7 +1241,7 @@ const BASE_CSS: &str = r#"
     margin: 2px 3px 2px 1px;
 }
 .limux-ws-in-folder .limux-sidebar-row-box {
-    margin-right: 10px;
+    margin-left: 22px;
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
@@ -1591,7 +1591,6 @@ pub fn build_window(app: &adw::Application) {
     sidebar_title.append(&sidebar_title_label);
 
     // Popover content is built here; item click handlers are wired after `state` exists.
-    // MenuButton owns the popover (do not set_parent) so open/close works reliably.
     let (add_btn_popover, add_btn_new_ws, add_btn_new_folder) = {
         let popover = gtk::Popover::new();
         popover.set_position(gtk::PositionType::Bottom);
@@ -1629,14 +1628,13 @@ pub fn build_window(app: &adw::Application) {
         (popover, new_ws_item, new_folder_item)
     };
 
-    let add_btn = gtk::MenuButton::builder()
+    let add_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("New workspace or folder")
         .has_frame(false)
-        .always_show_arrow(false)
-        .popover(&add_btn_popover)
         .build();
     add_btn.add_css_class("limux-sidebar-add-btn");
+    add_btn_popover.set_parent(&add_btn);
 
     // Drop target on the add button: workspace drags delete, tab drags create a new workspace.
     let btn_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
@@ -1744,6 +1742,16 @@ pub fn build_window(app: &adw::Application) {
         *slot.borrow_mut() = Some(state.clone());
     });
 
+    {
+        let pop = add_btn_popover.clone();
+        add_btn.connect_clicked(move |_btn| {
+            if pop.is_visible() {
+                pop.popdown();
+            } else {
+                pop.popup();
+            }
+        });
+    }
     {
         let state = state.clone();
         let pop = add_btn_popover.clone();
