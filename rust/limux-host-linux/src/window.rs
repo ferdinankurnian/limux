@@ -1587,7 +1587,8 @@ pub fn build_window(app: &adw::Application) {
         .build();
     add_btn.add_css_class("limux-sidebar-add-btn");
 
-    let add_btn_popover = {
+    // Popover UI is built here; click handlers are wired after `state` exists.
+    let (add_btn_popover, add_btn_new_ws, add_btn_new_folder) = {
         let popover = gtk::Popover::new();
         popover.set_parent(&add_btn);
         popover.set_position(gtk::PositionType::Bottom);
@@ -1618,24 +1619,7 @@ pub fn build_window(app: &adw::Application) {
         menu_box.append(&new_folder_item);
         popover.set_child(Some(&menu_box));
 
-        {
-            let state = state.clone();
-            let pop = popover.clone();
-            new_ws_item.connect_clicked(move |_| {
-                pop.popdown();
-                add_workspace(&state, None);
-            });
-        }
-        {
-            let state = state.clone();
-            let pop = popover.clone();
-            new_folder_item.connect_clicked(move |_| {
-                pop.popdown();
-                prompt_new_sidebar_folder(&state, None);
-            });
-        }
-
-        popover
+        (popover, new_ws_item, new_folder_item)
     };
 
     // Drop target on the add button: workspace drags delete, tab drags create a new workspace.
@@ -1716,6 +1700,23 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    {
+        let state = state.clone();
+        let pop = add_btn_popover.clone();
+        add_btn_new_ws.connect_clicked(move |_| {
+            pop.popdown();
+            add_workspace(&state, None);
+        });
+    }
+    {
+        let state = state.clone();
+        let pop = add_btn_popover.clone();
+        add_btn_new_folder.connect_clicked(move |_| {
+            pop.popdown();
+            prompt_new_sidebar_folder(&state, None);
+        });
+    }
 
     install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
 
@@ -1812,7 +1813,7 @@ pub fn build_window(app: &adw::Application) {
 
     {
         let state = state.clone();
-        add_btn.connect_clicked(move |btn| {
+        add_btn.connect_clicked(move |_btn| {
             let popover = {
                 let s = state.borrow();
                 s.add_btn_popover.clone()
@@ -1820,7 +1821,7 @@ pub fn build_window(app: &adw::Application) {
             if popover.is_visible() {
                 popover.popdown();
             } else {
-                popover.set_relative_position(gtk::PositionType::Bottom);
+                popover.set_position(gtk::PositionType::Bottom);
                 popover.popup();
             }
         });
@@ -3359,7 +3360,7 @@ fn toggle_folder_collapsed(state: &State, folder_id: Option<&str>) {
 
 /// Rebuild sidebar list order: optional folder sections, then workspace rows.
 fn sync_sidebar_row_order(state: &State) {
-    let mut s = state.borrow_mut();
+    let s = state.borrow_mut();
     while let Some(child) = s.sidebar_list.first_child() {
         s.sidebar_list.remove(&child);
     }
@@ -3603,8 +3604,7 @@ fn delete_sidebar_folder(state: &State, folder_id: &str) -> bool {
 
 fn prompt_new_sidebar_folder(state: &State, assign_workspace_id: Option<&str>) {
     let window = state.borrow().window.clone();
-    let dialog = adw::MessageDialog::new(
-        Some(&window),
+    let dialog = adw::AlertDialog::new(
         Some("New Folder"),
         Some("Enter a name for the sidebar folder."),
     );
@@ -3623,7 +3623,7 @@ fn prompt_new_sidebar_folder(state: &State, assign_workspace_id: Option<&str>) {
 
     let state = state.clone();
     let assign_workspace_id = assign_workspace_id.map(str::to_string);
-    dialog.connect_response(move |dialog, response| {
+    dialog.connect_response(None, move |_dialog, response| {
         if response != "create" {
             return;
         }
@@ -3633,9 +3633,8 @@ fn prompt_new_sidebar_folder(state: &State, assign_workspace_id: Option<&str>) {
                 move_workspace_to_folder(&state, workspace_id, Some(&folder_id));
             }
         }
-        dialog.close();
     });
-    dialog.present();
+    dialog.present(Some(&window));
 }
 
 fn prompt_rename_sidebar_folder(state: &State, folder_id: &str) {
@@ -3653,8 +3652,7 @@ fn prompt_rename_sidebar_folder(state: &State, folder_id: &str) {
         return;
     }
 
-    let dialog = adw::MessageDialog::new(
-        Some(&window),
+    let dialog = adw::AlertDialog::new(
         Some("Rename Folder"),
         Some("Enter a new name for the folder."),
     );
@@ -3674,13 +3672,12 @@ fn prompt_rename_sidebar_folder(state: &State, folder_id: &str) {
 
     let state = state.clone();
     let folder_id = folder_id.to_string();
-    dialog.connect_response(move |dialog, response| {
+    dialog.connect_response(None, move |_dialog, response| {
         if response == "rename" {
             rename_sidebar_folder(&state, &folder_id, &entry.text());
         }
-        dialog.close();
     });
-    dialog.present();
+    dialog.present(Some(&window));
 }
 
 fn show_folder_context_menu(state: &State, folder_id: &str, row: &gtk::ListBoxRow) {
