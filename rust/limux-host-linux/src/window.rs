@@ -1240,6 +1240,9 @@ const BASE_CSS: &str = r#"
     border-radius: 6px;
     margin: 2px 3px 2px 1px;
 }
+.limux-ws-in-folder .limux-sidebar-row-box {
+    margin-right: 10px;
+}
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
     font-size: 15px;
@@ -1320,10 +1323,10 @@ row:selected .limux-ws-star-btn {
     letter-spacing: 1px;
 }
 .limux-folder-header-row {
-    margin: 2px 2px 0 2px;
+    margin: 2px 3px 0 1px;
 }
 .limux-folder-header-btn {
-    padding: 4px 6px;
+    padding: 3px 6px;
     border-radius: 6px;
     min-height: 0;
 }
@@ -1396,7 +1399,7 @@ row:selected .limux-ws-star-btn {
 .limux-sidebar-add-btn {
     min-height: 0;
     min-width: 0;
-    padding: 2px 6px;
+    padding: 0px 3px;
     border-radius: 5px;
     color: alpha(@window_fg_color, 0.55);
 }
@@ -3389,6 +3392,7 @@ fn sync_sidebar_row_order(state: &State) {
         for idx in indices {
             let row = s.workspaces[idx].sidebar_row.clone();
             row.set_visible(!collapsed);
+            row.add_css_class("limux-ws-in-folder");
             s.sidebar_list.append(&row);
         }
     }
@@ -3397,6 +3401,7 @@ fn sync_sidebar_row_order(state: &State) {
     for idx in unassigned {
         let row = s.workspaces[idx].sidebar_row.clone();
         row.set_visible(true);
+        row.remove_css_class("limux-ws-in-folder");
         s.sidebar_list.append(&row);
     }
 
