@@ -28,11 +28,27 @@ pub struct LoadedSession {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SidebarFolderState {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SidebarState {
     #[serde(default = "default_sidebar_visible")]
     pub visible: bool,
     #[serde(default = "default_sidebar_width")]
     pub width: i32,
+    /// User-defined sidebar folders for grouping workspaces.
+    ///
+    /// Distinct from each workspace's `folder_path` (project/cwd path).
+    #[serde(default)]
+    pub folders: Vec<SidebarFolderState>,
+    /// Collapse state for the virtual "Ungrouped" section.
+    #[serde(default)]
+    pub ungrouped_collapsed: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -58,8 +74,12 @@ pub struct WorkspaceState {
     pub favorite: bool,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Project/filesystem path this workspace was opened with (shown under the name).
     #[serde(default)]
     pub folder_path: Option<String>,
+    /// Optional sidebar folder id for UI grouping. `None` means Ungrouped.
+    #[serde(default)]
+    pub folder_id: Option<String>,
     pub layout: LayoutNodeState,
 }
 
@@ -215,6 +235,8 @@ impl Default for SidebarState {
         Self {
             visible: default_sidebar_visible(),
             width: default_sidebar_width(),
+            folders: Vec::new(),
+            ungrouped_collapsed: false,
         }
     }
 }
@@ -380,6 +402,7 @@ pub fn split_position_from_ratio(ratio: f64, total_size: i32) -> i32 {
 pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
     state.version = SESSION_VERSION;
     state.sidebar.width = state.sidebar.width.max(DEFAULT_SIDEBAR_WIDTH);
+    normalize_sidebar_folders(&mut state);
     if state.workspaces.is_empty() {
         state.active_workspace_index = 0;
     } else if state.active_workspace_index >= state.workspaces.len() {
@@ -395,6 +418,40 @@ pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
         );
     }
     state
+}
+
+/// Keep folder metadata consistent and clear dangling workspace assignments.
+fn normalize_sidebar_folders(state: &mut AppSessionState) {
+    let mut seen_ids = std::collections::HashSet::new();
+    state.sidebar.folders.retain(|folder| {
+        let id = folder.id.trim();
+        let name = folder.name.trim();
+        if id.is_empty() || name.is_empty() || !seen_ids.insert(id.to_string()) {
+            return false;
+        }
+        true
+    });
+    for folder in &mut state.sidebar.folders {
+        folder.id = folder.id.trim().to_string();
+        folder.name = folder.name.trim().to_string();
+    }
+
+    let known_ids: std::collections::HashSet<String> = state
+        .sidebar
+        .folders
+        .iter()
+        .map(|folder| folder.id.clone())
+        .collect();
+    for workspace in &mut state.workspaces {
+        if let Some(folder_id) = workspace.folder_id.as_deref() {
+            let trimmed = folder_id.trim();
+            if trimmed.is_empty() || !known_ids.contains(trimmed) {
+                workspace.folder_id = None;
+            } else if trimmed != folder_id {
+                workspace.folder_id = Some(trimmed.to_string());
+            }
+        }
+    }
 }
 
 pub fn normalize_layout(layout: &mut LayoutNodeState, working_directory: Option<&str>) {
@@ -439,6 +496,7 @@ impl AppSessionState {
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
+                    folder_id: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -982,6 +1040,7 @@ mod tests {
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
+                folder_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1083,6 +1142,7 @@ mod tests {
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
+                folder_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1602,6 +1662,7 @@ mod tests {
                 favorite: false,
                 cwd: None,
                 folder_path: None,
+                folder_id: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
@@ -1625,6 +1686,137 @@ mod tests {
         };
         assert_eq!(pane.active_tab_id.as_deref(), Some("keybinds-1"));
         assert!(matches!(pane.tabs[0].content, TabContentState::Keybinds {}));
+    }
+
+    #[test]
+    fn session_without_folders_field_defaults_backward_compatibly() {
+        let raw = r#"{
+            "version": 1,
+            "active_workspace_index": 0,
+            "sidebar": {
+                "visible": true,
+                "width": 220
+            },
+            "workspaces": [{
+                "name": "plain",
+                "favorite": false,
+                "layout": {
+                    "kind": "pane",
+                    "active_tab_id": "terminal-0",
+                    "tabs": [{
+                        "id": "terminal-0",
+                        "tab_kind": "terminal",
+                        "cwd": "/tmp"
+                    }]
+                }
+            }]
+        }"#;
+        let decoded: AppSessionState = serde_json::from_str(raw).expect("decode");
+        assert!(decoded.sidebar.folders.is_empty());
+        assert!(!decoded.sidebar.ungrouped_collapsed);
+        assert_eq!(decoded.workspaces[0].folder_id, None);
+    }
+
+    #[test]
+    fn normalize_session_clears_dangling_folder_ids_and_dedupes_folders() {
+        let state = normalize_session(AppSessionState {
+            sidebar: SidebarState {
+                folders: vec![
+                    SidebarFolderState {
+                        id: " folder-a ".to_string(),
+                        name: " Alpha ".to_string(),
+                        collapsed: true,
+                    },
+                    SidebarFolderState {
+                        id: "folder-a".to_string(),
+                        name: "Duplicate".to_string(),
+                        collapsed: false,
+                    },
+                    SidebarFolderState {
+                        id: "".to_string(),
+                        name: "Empty id".to_string(),
+                        collapsed: false,
+                    },
+                    SidebarFolderState {
+                        id: "folder-b".to_string(),
+                        name: "   ".to_string(),
+                        collapsed: false,
+                    },
+                ],
+                ..SidebarState::default()
+            },
+            workspaces: vec![
+                WorkspaceState {
+                    id: Some("ws-1".to_string()),
+                    name: "in-folder".to_string(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                    folder_id: Some(" folder-a ".to_string()),
+                    layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+                },
+                WorkspaceState {
+                    id: Some("ws-2".to_string()),
+                    name: "dangling".to_string(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                    folder_id: Some("missing".to_string()),
+                    layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+                },
+            ],
+            ..AppSessionState::default()
+        });
+
+        assert_eq!(state.sidebar.folders.len(), 1);
+        assert_eq!(state.sidebar.folders[0].id, "folder-a");
+        assert_eq!(state.sidebar.folders[0].name, "Alpha");
+        assert!(state.sidebar.folders[0].collapsed);
+        assert_eq!(state.workspaces[0].folder_id.as_deref(), Some("folder-a"));
+        assert_eq!(state.workspaces[1].folder_id, None);
+    }
+
+    #[test]
+    fn sidebar_folders_round_trip_through_session_json() {
+        let state = AppSessionState {
+            sidebar: SidebarState {
+                folders: vec![SidebarFolderState {
+                    id: "folder-1".to_string(),
+                    name: "Work".to_string(),
+                    collapsed: true,
+                }],
+                ungrouped_collapsed: true,
+                ..SidebarState::default()
+            },
+            workspaces: vec![WorkspaceState {
+                id: Some("ws-1".to_string()),
+                name: "grouped".to_string(),
+                favorite: false,
+                cwd: Some("/tmp/project".to_string()),
+                folder_path: Some("/tmp/project".to_string()),
+                folder_id: Some("folder-1".to_string()),
+                layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp/project"))),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let raw = serde_json::to_string(&state).expect("serialize");
+        let decoded: AppSessionState = serde_json::from_str(&raw).expect("deserialize");
+        let normalized = normalize_session(decoded);
+
+        assert_eq!(normalized.sidebar.folders.len(), 1);
+        assert_eq!(normalized.sidebar.folders[0].name, "Work");
+        assert!(normalized.sidebar.folders[0].collapsed);
+        assert!(normalized.sidebar.ungrouped_collapsed);
+        assert_eq!(
+            normalized.workspaces[0].folder_id.as_deref(),
+            Some("folder-1")
+        );
+        // Project path is independent of sidebar folder assignment.
+        assert_eq!(
+            normalized.workspaces[0].folder_path.as_deref(),
+            Some("/tmp/project")
+        );
     }
 
     #[test]
