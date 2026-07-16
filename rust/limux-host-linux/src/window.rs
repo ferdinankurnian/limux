@@ -28,8 +28,6 @@ use crate::split_tree::{self, SplitTreeContainer};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
-const SIDEBAR_UNGROUPED_FOLDER_LABEL: &str = "Ungrouped";
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -67,7 +65,7 @@ struct Workspace {
     cwd: Rc<RefCell<Option<String>>>,
     /// The project/filesystem path this workspace was opened with.
     folder_path: Option<String>,
-    /// Optional sidebar folder id for UI grouping (`None` = Ungrouped).
+    /// Optional sidebar folder id for UI grouping (`None` = not in a folder).
     folder_id: Option<String>,
     /// Path label shown below workspace name in sidebar.
     #[allow(dead_code)]
@@ -89,15 +87,13 @@ pub(crate) struct AppState {
     sidebar_list: gtk::ListBox,
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
-    add_btn: gtk::Button,
+    add_btn: gtk::MenuButton,
     add_btn_popover: gtk::Popover,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
     /// User-defined sidebar folders (order = display order).
     sidebar_folders: Vec<SidebarFolder>,
-    /// Collapse state for the virtual Ungrouped section.
-    ungrouped_collapsed: bool,
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
@@ -911,7 +907,6 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
                 collapsed: folder.collapsed,
             })
             .collect();
-        s.ungrouped_collapsed = loaded.state.sidebar.ungrouped_collapsed;
     }
 
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
@@ -1043,7 +1038,8 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             visible: sidebar_visible,
             width: sidebar_width,
             folders,
-            ungrouped_collapsed: s.ungrouped_collapsed,
+            // Kept for session JSON compat; ungrouped workspaces are no longer a collapsible section.
+            ungrouped_collapsed: false,
         },
         workspaces,
     })
@@ -1324,20 +1320,44 @@ row:selected .limux-ws-star-btn {
     letter-spacing: 1px;
 }
 .limux-folder-header-row {
-    margin: 4px 4px 2px 2px;
+    margin: 2px 2px 0 2px;
 }
 .limux-folder-header-btn {
-    color: alpha(@window_fg_color, 0.56);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.8px;
-    padding: 2px 6px;
-    border-radius: 5px;
-    text-align: left;
+    padding: 4px 6px;
+    border-radius: 6px;
     min-height: 0;
 }
 .limux-folder-header-btn:hover {
-    color: alpha(@window_fg_color, 0.8);
+    background: alpha(@window_fg_color, 0.08);
+}
+.limux-folder-header-content {
+    min-height: 0;
+}
+.limux-folder-chevron,
+.limux-folder-icon {
+    color: alpha(@window_fg_color, 0.55);
+    -gtk-icon-size: 12px;
+}
+.limux-folder-name {
+    color: alpha(@window_fg_color, 0.85);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0;
+}
+.limux-folder-count {
+    color: alpha(@window_fg_color, 0.45);
+    font-size: 12px;
+    font-weight: 500;
+    font-feature-settings: "tnum";
+    margin-start: 8px;
+}
+.limux-folder-header-btn:hover .limux-folder-chevron,
+.limux-folder-header-btn:hover .limux-folder-icon,
+.limux-folder-header-btn:hover .limux-folder-name {
+    color: @window_fg_color;
+}
+.limux-folder-header-btn:hover .limux-folder-count {
+    color: alpha(@window_fg_color, 0.65);
 }
 .limux-sidebar-btn {
     background: alpha(@window_fg_color, 0.08);
@@ -1395,6 +1415,10 @@ row:selected .limux-ws-star-btn {
 .limux-sidebar-add-btn.limux-tab-drop-target {
     background-color: alpha(@accent_bg_color, 0.28);
     border-color: alpha(@accent_bg_color, 0.9);
+}
+.limux-sidebar-add-menu-item {
+    min-height: 0;
+    padding: 6px 10px;
 }
 .limux-ws-path {
     color: alpha(@window_fg_color, 0.3);
@@ -1563,34 +1587,10 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title.append(&sidebar_title_label);
 
-    {
-        let window = window.clone();
-        let drag_title = sidebar_title.clone();
-        let drag = gtk::GestureClick::new();
-        drag.set_button(1);
-        drag.connect_pressed(move |gesture, _, x, y| {
-            let Some(device) = gesture.current_event_device() else {
-                return;
-            };
-            let button = gesture.current_button() as i32;
-            let timestamp = gesture.current_event_time();
-            begin_window_move_from_widget(&drag_title, &window, &device, button, x, y, timestamp);
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        });
-        sidebar_title.add_controller(drag);
-    }
-
-    let add_btn = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("New workspace or folder")
-        .has_frame(false)
-        .build();
-    add_btn.add_css_class("limux-sidebar-add-btn");
-
-    // Popover UI is built here; click handlers are wired after `state` exists.
+    // Popover content is built here; item click handlers are wired after `state` exists.
+    // MenuButton owns the popover (do not set_parent) so open/close works reliably.
     let (add_btn_popover, add_btn_new_ws, add_btn_new_folder) = {
         let popover = gtk::Popover::new();
-        popover.set_parent(&add_btn);
         popover.set_position(gtk::PositionType::Bottom);
 
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1603,17 +1603,21 @@ pub fn build_window(app: &adw::Application) {
             .icon_name("list-add-symbolic")
             .label("New Workspace")
             .has_frame(false)
-            .halign(gtk::Align::Fill)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
             .build();
         new_ws_item.add_css_class("flat");
+        new_ws_item.add_css_class("limux-sidebar-add-menu-item");
 
         let new_folder_item = gtk::Button::builder()
             .icon_name("folder-new-symbolic")
             .label("New Folder")
             .has_frame(false)
-            .halign(gtk::Align::Fill)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
             .build();
         new_folder_item.add_css_class("flat");
+        new_folder_item.add_css_class("limux-sidebar-add-menu-item");
 
         menu_box.append(&new_ws_item);
         menu_box.append(&new_folder_item);
@@ -1621,6 +1625,15 @@ pub fn build_window(app: &adw::Application) {
 
         (popover, new_ws_item, new_folder_item)
     };
+
+    let add_btn = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("New workspace or folder")
+        .has_frame(false)
+        .always_show_arrow(false)
+        .popover(&add_btn_popover)
+        .build();
+    add_btn.add_css_class("limux-sidebar-add-btn");
 
     // Drop target on the add button: workspace drags delete, tab drags create a new workspace.
     let btn_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
@@ -1646,6 +1659,34 @@ pub fn build_window(app: &adw::Application) {
     add_btn.add_controller(btn_drop.clone());
 
     sidebar_title.append(&add_btn);
+
+    // Window-drag on the title row must not steal clicks from the + menu button
+    // (or any future interactive children).
+    {
+        let window = window.clone();
+        let drag_title = sidebar_title.clone();
+        let title_label = sidebar_title_label.clone();
+        let drag = gtk::GestureClick::new();
+        drag.set_button(1);
+        drag.connect_pressed(move |gesture, _, x, y| {
+            if let Some(target) = drag_title.pick(x, y, gtk::PickFlags::DEFAULT) {
+                let title_w = drag_title.upcast_ref::<gtk::Widget>();
+                let label_w = title_label.upcast_ref::<gtk::Widget>();
+                let on_chrome = target == *title_w || target == *label_w;
+                if !on_chrome {
+                    return;
+                }
+            }
+            let Some(device) = gesture.current_event_device() else {
+                return;
+            };
+            let button = gesture.current_button() as i32;
+            let timestamp = gesture.current_event_time();
+            begin_window_move_from_widget(&drag_title, &window, &device, button, x, y, timestamp);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        sidebar_title.add_controller(drag);
+    }
 
     let sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1685,7 +1726,6 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
         sidebar_folders: Vec::new(),
-        ungrouped_collapsed: false,
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
@@ -1714,7 +1754,7 @@ pub fn build_window(app: &adw::Application) {
         let pop = add_btn_popover.clone();
         add_btn_new_folder.connect_clicked(move |_| {
             pop.popdown();
-            prompt_new_sidebar_folder(&state, None);
+            prompt_new_sidebar_folder(&state);
         });
     }
 
@@ -1807,22 +1847,6 @@ pub fn build_window(app: &adw::Application) {
                 if let Some(idx) = idx {
                     switch_workspace(&state, idx);
                 }
-            }
-        });
-    }
-
-    {
-        let state = state.clone();
-        add_btn.connect_clicked(move |_btn| {
-            let popover = {
-                let s = state.borrow();
-                s.add_btn_popover.clone()
-            };
-            if popover.is_visible() {
-                popover.popdown();
-            } else {
-                popover.set_position(gtk::PositionType::Bottom);
-                popover.popup();
             }
         });
     }
@@ -3100,19 +3124,59 @@ fn set_workspace_path_label(path_label: &gtk::Label, folder_path: Option<&str>) 
     }
 }
 
+/// GNOME-style folder row: chevron + folder icon + name … count (space-between).
 fn build_folder_header_row(
     title: &str,
     collapsed: bool,
     workspace_count: usize,
 ) -> (gtk::ListBoxRow, gtk::Button) {
-    let marker = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
-    let button = gtk::Button::builder()
-        .label(format!("{marker} {title} ({workspace_count})"))
+    // pan-end / pan-down match Nautilus expanders better than triangle glyphs.
+    let chevron_name = if collapsed {
+        "pan-end-symbolic"
+    } else {
+        "pan-down-symbolic"
+    };
+    let chevron = gtk::Image::from_icon_name(chevron_name);
+    chevron.add_css_class("limux-folder-chevron");
+    chevron.set_pixel_size(12);
+
+    let folder_icon = gtk::Image::from_icon_name("folder-symbolic");
+    folder_icon.add_css_class("limux-folder-icon");
+    folder_icon.set_pixel_size(14);
+
+    let name = gtk::Label::builder()
+        .label(title)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .xalign(0.0)
+        .build();
+    name.add_css_class("limux-folder-name");
+
+    let count = gtk::Label::builder()
+        .label(workspace_count.to_string())
+        .halign(gtk::Align::End)
+        .build();
+    count.add_css_class("limux-folder-count");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
         .halign(gtk::Align::Fill)
         .hexpand(true)
         .build();
-    button.set_halign(gtk::Align::Fill);
-    button.set_has_frame(false);
+    content.add_css_class("limux-folder-header-content");
+    content.append(&chevron);
+    content.append(&folder_icon);
+    content.append(&name);
+    content.append(&count);
+
+    let button = gtk::Button::builder()
+        .child(&content)
+        .halign(gtk::Align::Fill)
+        .hexpand(true)
+        .has_frame(false)
+        .build();
     button.add_css_class("flat");
     button.add_css_class("limux-folder-header-btn");
 
@@ -3192,22 +3256,9 @@ fn next_active_workspace_index(
     removed_idx.min(remaining_workspace_ids.len() - 1)
 }
 
+/// Workspace row context menu: rename / delete only.
+/// Folder create is via the header + menu; move into a folder is drag-and-drop.
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
-    let folders: Vec<(String, String)> = {
-        let s = state.borrow();
-        s.sidebar_folders
-            .iter()
-            .map(|folder| (folder.id.clone(), folder.name.clone()))
-            .collect()
-    };
-    let current_folder_id = {
-        let s = state.borrow();
-        s.workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .and_then(|workspace| workspace.folder_id.clone())
-    };
-
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     menu_box.set_margin_top(4);
     menu_box.set_margin_bottom(4);
@@ -3216,44 +3267,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
 
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
-    let new_folder_btn = gtk::Button::with_label("New Folder…");
-    new_folder_btn.add_css_class("flat");
     let delete_btn = gtk::Button::with_label("Delete");
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
     menu_box.append(&rename_btn);
-    menu_box.append(&new_folder_btn);
-
-    if !folders.is_empty() || current_folder_id.is_some() {
-        let move_label = gtk::Label::builder()
-            .label("Move to")
-            .xalign(0.0)
-            .margin_start(8)
-            .margin_top(4)
-            .build();
-        move_label.add_css_class("dim-label");
-        menu_box.append(&move_label);
-
-        if current_folder_id.is_some() {
-            let ungrouped_btn = gtk::Button::with_label(SIDEBAR_UNGROUPED_FOLDER_LABEL);
-            ungrouped_btn.add_css_class("flat");
-            menu_box.append(&ungrouped_btn);
-            // Handler wired after popover is created.
-            ungrouped_btn.set_widget_name("move-ungrouped");
-        }
-
-        for (folder_id, folder_name) in &folders {
-            if current_folder_id.as_deref() == Some(folder_id.as_str()) {
-                continue;
-            }
-            let btn = gtk::Button::with_label(folder_name);
-            btn.add_css_class("flat");
-            btn.set_widget_name(&format!("move-folder:{folder_id}"));
-            menu_box.append(&btn);
-        }
-    }
-
     menu_box.append(&delete_btn);
 
     let popover = gtk::Popover::new();
@@ -3274,48 +3292,11 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let state = state.clone();
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
-        new_folder_btn.connect_clicked(move |_| {
-            pop.popdown();
-            prompt_new_sidebar_folder(&state, Some(&ws_id));
-        });
-    }
-    {
-        let state = state.clone();
-        let ws_id = workspace_id.to_string();
-        let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
             close_workspace_by_id(&state, &ws_id);
             request_session_save(&state);
         });
-    }
-
-    // Wire "Move to" buttons by walking children with widget names.
-    let mut child = menu_box.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        let Some(btn) = widget.downcast_ref::<gtk::Button>() else {
-            continue;
-        };
-        let name = btn.widget_name();
-        if name.as_str() == "move-ungrouped" {
-            let state = state.clone();
-            let ws_id = workspace_id.to_string();
-            let pop = popover.clone();
-            btn.connect_clicked(move |_| {
-                pop.popdown();
-                move_workspace_to_folder(&state, &ws_id, None);
-            });
-        } else if let Some(folder_id) = name.strip_prefix("move-folder:") {
-            let state = state.clone();
-            let ws_id = workspace_id.to_string();
-            let folder_id = folder_id.to_string();
-            let pop = popover.clone();
-            btn.connect_clicked(move |_| {
-                pop.popdown();
-                move_workspace_to_folder(&state, &ws_id, Some(&folder_id));
-            });
-        }
     }
 
     {
@@ -3340,105 +3321,83 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
-fn toggle_folder_collapsed(state: &State, folder_id: Option<&str>) {
+fn toggle_folder_collapsed(state: &State, folder_id: &str) {
     {
         let mut s = state.borrow_mut();
-        match folder_id {
-            Some(id) => {
-                if let Some(folder) = s.sidebar_folders.iter_mut().find(|f| f.id == id) {
-                    folder.collapsed = !folder.collapsed;
-                }
-            }
-            None => {
-                s.ungrouped_collapsed = !s.ungrouped_collapsed;
-            }
+        if let Some(folder) = s.sidebar_folders.iter_mut().find(|f| f.id == folder_id) {
+            folder.collapsed = !folder.collapsed;
         }
     }
     sync_sidebar_row_order(state);
     request_session_save(state);
 }
 
-/// Rebuild sidebar list order: optional folder sections, then workspace rows.
+/// Rebuild sidebar list order: named folders (with members), then unassigned workspaces.
+/// Unassigned workspaces are plain rows — no virtual "Ungrouped" section.
 fn sync_sidebar_row_order(state: &State) {
     let s = state.borrow_mut();
     while let Some(child) = s.sidebar_list.first_child() {
         s.sidebar_list.remove(&child);
     }
 
-    let show_sections = !s.sidebar_folders.is_empty();
-
-    // (folder_id, title, collapsed, workspace indices)
-    let mut sections: Vec<(Option<String>, String, bool, Vec<usize>)> = Vec::new();
-    if show_sections {
-        for folder in &s.sidebar_folders {
-            sections.push((
-                Some(folder.id.clone()),
+    // (folder_id, title, collapsed, workspace indices) — folder_id is always Some for headers.
+    let mut folder_sections: Vec<(String, String, bool, Vec<usize>)> = s
+        .sidebar_folders
+        .iter()
+        .map(|folder| {
+            (
+                folder.id.clone(),
                 folder.name.clone(),
                 folder.collapsed,
                 Vec::new(),
-            ));
-        }
-        sections.push((
-            None,
-            SIDEBAR_UNGROUPED_FOLDER_LABEL.to_string(),
-            s.ungrouped_collapsed,
-            Vec::new(),
-        ));
-
-        for (idx, workspace) in s.workspaces.iter().enumerate() {
-            let section_idx = match workspace.folder_id.as_deref() {
-                Some(fid) => sections
-                    .iter()
-                    .position(|(id, _, _, _)| id.as_deref() == Some(fid))
-                    .unwrap_or(sections.len() - 1),
-                None => sections.len() - 1,
-            };
-            sections[section_idx].3.push(idx);
-        }
-    } else {
-        let indices: Vec<usize> = (0..s.workspaces.len()).collect();
-        sections.push((None, String::new(), false, indices));
-    }
-
-    // Build widgets without holding callbacks that need &State while mutably borrowing.
-    let section_widgets: Vec<(
-        Option<String>,
-        Option<(gtk::ListBoxRow, gtk::Button)>,
-        Vec<(usize, gtk::ListBoxRow)>,
-        bool,
-    )> = sections
-        .into_iter()
-        .map(|(folder_id, title, collapsed, indices)| {
-            let header = if show_sections {
-                Some(build_folder_header_row(&title, collapsed, indices.len()))
-            } else {
-                None
-            };
-            let rows = indices
-                .into_iter()
-                .map(|idx| (idx, s.workspaces[idx].sidebar_row.clone()))
-                .collect();
-            (folder_id, header, rows, collapsed)
+            )
         })
         .collect();
+    let mut unassigned: Vec<usize> = Vec::new();
 
-    for (folder_id, header, rows, collapsed) in section_widgets {
-        if let Some((header_row, header_button)) = header {
-            {
-                let state = state.clone();
-                let folder_id = folder_id.clone();
-                header_button.connect_clicked(move |_| {
-                    toggle_folder_collapsed(&state, folder_id.as_deref());
-                });
+    for (idx, workspace) in s.workspaces.iter().enumerate() {
+        match workspace.folder_id.as_deref() {
+            Some(fid) => {
+                if let Some(section) = folder_sections
+                    .iter_mut()
+                    .find(|(id, _, _, _)| id.as_str() == fid)
+                {
+                    section.3.push(idx);
+                } else {
+                    // Dangling folder id — treat as unassigned.
+                    unassigned.push(idx);
+                }
             }
-            install_folder_header_interactions(state, folder_id.as_deref(), &header_row);
-            s.sidebar_list.append(&header_row);
+            None => unassigned.push(idx),
         }
+    }
 
-        for (_idx, row) in rows {
+    // Build folder sections (header always shown when a folder exists, even if empty).
+    for (folder_id, title, collapsed, indices) in folder_sections {
+        let (header_row, header_button) =
+            build_folder_header_row(&title, collapsed, indices.len());
+        {
+            let state = state.clone();
+            let folder_id = folder_id.clone();
+            header_button.connect_clicked(move |_| {
+                toggle_folder_collapsed(&state, &folder_id);
+            });
+        }
+        install_folder_header_interactions(state, &folder_id, &header_row);
+        s.sidebar_list.append(&header_row);
+
+        for idx in indices {
+            let row = s.workspaces[idx].sidebar_row.clone();
             row.set_visible(!collapsed);
             s.sidebar_list.append(&row);
         }
+    }
+
+    // Loose workspaces: no section chrome, always visible.
+    for idx in unassigned {
+        let row = s.workspaces[idx].sidebar_row.clone();
+        row.set_visible(true);
+        s.sidebar_list.append(&row);
     }
 
     let active_row = s
@@ -3453,11 +3412,7 @@ fn sync_sidebar_row_order(state: &State) {
     }
 }
 
-fn install_folder_header_interactions(
-    state: &State,
-    folder_id: Option<&str>,
-    row: &gtk::ListBoxRow,
-) {
+fn install_folder_header_interactions(state: &State, folder_id: &str, row: &gtk::ListBoxRow) {
     // Drop workspace onto folder header → assign to that folder.
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
     drop_target.set_preload(true);
@@ -3476,7 +3431,7 @@ fn install_folder_header_interactions(
     }
     {
         let state = state.clone();
-        let folder_id = folder_id.map(str::to_string);
+        let folder_id = folder_id.to_string();
         let row = row.clone();
         drop_target.connect_drop(move |_, value, _, _| {
             row.remove_css_class("limux-tab-drop-target");
@@ -3487,25 +3442,23 @@ fn install_folder_header_interactions(
             if payload.contains(':') {
                 return false;
             }
-            move_workspace_to_folder(&state, &payload, folder_id.as_deref())
+            move_workspace_to_folder(&state, &payload, Some(&folder_id))
         });
     }
     row.add_controller(drop_target);
 
-    // Right-click: rename / delete (named folders only).
-    if folder_id.is_some() {
-        let right_click = gtk::GestureClick::new();
-        right_click.set_button(3);
-        {
-            let state = state.clone();
-            let folder_id = folder_id.expect("checked above").to_string();
-            let row = row.clone();
-            right_click.connect_pressed(move |_, _, _, _| {
-                show_folder_context_menu(&state, &folder_id, &row);
-            });
-        }
-        row.add_controller(right_click);
+    // Right-click: rename / delete folder.
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    {
+        let state = state.clone();
+        let folder_id = folder_id.to_string();
+        let row = row.clone();
+        right_click.connect_pressed(move |_, _, _, _| {
+            show_folder_context_menu(&state, &folder_id, &row);
+        });
     }
+    row.add_controller(right_click);
 }
 
 fn move_workspace_to_folder(state: &State, workspace_id: &str, folder_id: Option<&str>) -> bool {
@@ -3602,7 +3555,7 @@ fn delete_sidebar_folder(state: &State, folder_id: &str) -> bool {
     removed
 }
 
-fn prompt_new_sidebar_folder(state: &State, assign_workspace_id: Option<&str>) {
+fn prompt_new_sidebar_folder(state: &State) {
     let window = state.borrow().window.clone();
     let dialog = adw::AlertDialog::new(
         Some("New Folder"),
@@ -3622,17 +3575,12 @@ fn prompt_new_sidebar_folder(state: &State, assign_workspace_id: Option<&str>) {
     dialog.set_extra_child(Some(&entry));
 
     let state = state.clone();
-    let assign_workspace_id = assign_workspace_id.map(str::to_string);
     dialog.connect_response(None, move |_dialog, response| {
         if response != "create" {
             return;
         }
         let name = entry.text().to_string();
-        if let Some(folder_id) = create_sidebar_folder(&state, &name) {
-            if let Some(workspace_id) = assign_workspace_id.as_deref() {
-                move_workspace_to_folder(&state, workspace_id, Some(&folder_id));
-            }
-        }
+        let _ = create_sidebar_folder(&state, &name);
     });
     dialog.present(Some(&window));
 }
@@ -5540,29 +5488,16 @@ fn switch_workspace(state: &State, idx: usize) {
 /// If the workspace at `idx` sits in a collapsed folder, expand it. Returns whether state changed.
 fn expand_folder_for_workspace_index(state: &State, idx: usize) -> bool {
     let mut s = state.borrow_mut();
-    let folder_id = match s.workspaces.get(idx) {
-        Some(workspace) => workspace.folder_id.clone(),
-        None => return false,
+    let Some(folder_id) = s.workspaces.get(idx).and_then(|ws| ws.folder_id.clone()) else {
+        return false;
     };
-    match folder_id {
-        Some(folder_id) => {
-            if let Some(folder) = s.sidebar_folders.iter_mut().find(|f| f.id == folder_id) {
-                if folder.collapsed {
-                    folder.collapsed = false;
-                    return true;
-                }
-            }
-            false
-        }
-        None => {
-            if s.ungrouped_collapsed {
-                s.ungrouped_collapsed = false;
-                true
-            } else {
-                false
-            }
+    if let Some(folder) = s.sidebar_folders.iter_mut().find(|f| f.id == folder_id) {
+        if folder.collapsed {
+            folder.collapsed = false;
+            return true;
         }
     }
+    false
 }
 
 fn cycle_workspace(state: &State, direction: i32) {

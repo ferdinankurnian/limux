@@ -46,7 +46,8 @@ pub struct SidebarState {
     /// Distinct from each workspace's `folder_path` (project/cwd path).
     #[serde(default)]
     pub folders: Vec<SidebarFolderState>,
-    /// Collapse state for the virtual "Ungrouped" section.
+    /// Legacy field: unassigned workspaces are no longer a collapsible section.
+    /// Kept so older session JSON still deserializes; always ignored at runtime.
     #[serde(default)]
     pub ungrouped_collapsed: bool,
 }
@@ -77,7 +78,7 @@ pub struct WorkspaceState {
     /// Project/filesystem path this workspace was opened with (shown under the name).
     #[serde(default)]
     pub folder_path: Option<String>,
-    /// Optional sidebar folder id for UI grouping. `None` means Ungrouped.
+    /// Optional sidebar folder id for UI grouping. `None` means not in a folder.
     #[serde(default)]
     pub folder_id: Option<String>,
     pub layout: LayoutNodeState,
