@@ -1242,6 +1242,7 @@ const BASE_CSS: &str = r#"
 }
 .limux-ws-in-folder .limux-sidebar-row-box {
     margin-left: 22px;
+    margin-right: 10px;
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
