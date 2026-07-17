@@ -1240,7 +1240,7 @@ const BASE_CSS: &str = r#"
     border-radius: 6px;
     margin: 2px 3px 2px 1px;
 }
-.limux-ws-in-folder .limux-sidebar-row-box {
+.limux-ws-in-folder {
     margin-left: 22px;
     margin-right: 10px;
 }
