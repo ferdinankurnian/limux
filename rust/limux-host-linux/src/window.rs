@@ -1249,7 +1249,7 @@ const BASE_CSS: &str = r#"
 }
 .limux-ws-in-folder {
     margin-left: 22px;
-    margin-right: 10px;
+    margin-right: 3px;
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
