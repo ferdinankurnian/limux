@@ -1339,14 +1339,11 @@ row:selected .limux-ws-star-btn {
     border-radius: 6px;
     min-height: 0;
 }
-.limux-folder-header-btn:hover {
-    background: alpha(@window_fg_color, 0.08);
-}
-.limux-sidebar list.navigation-sidebar row:not(.limux-folder-header-row):hover {
+.limux-sidebar list.navigation-sidebar row:hover {
     background: alpha(@window_fg_color, 0.08);
     border-radius: 6px;
 }
-.limux-sidebar list.navigation-sidebar row:not(.limux-folder-header-row):selected {
+.limux-sidebar list.navigation-sidebar row:selected {
     background: alpha(@window_fg_color, 0.08);
     border-radius: 6px;
 }
