@@ -1433,6 +1433,15 @@ row:selected .limux-ws-star-btn {
 .limux-sidebar-add-menu-item {
     min-height: 0;
     padding: 6px 10px;
+    border-radius: 6px;
+}
+.limux-sidebar-add-menu-item:hover {
+    background: alpha(@window_fg_color, 0.08);
+}
+.limux-menu-item-accel {
+    color: alpha(@window_fg_color, 0.4);
+    font-size: 12px;
+    margin-start: 12px;
 }
 .limux-ws-path {
     color: alpha(@window_fg_color, 0.3);
@@ -1612,25 +1621,55 @@ pub fn build_window(app: &adw::Application) {
         menu_box.set_margin_start(4);
         menu_box.set_margin_end(4);
 
-        let new_ws_item = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .label("New Workspace")
-            .has_frame(false)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .build();
-        new_ws_item.add_css_class("flat");
-        new_ws_item.add_css_class("limux-sidebar-add-menu-item");
+        fn build_add_menu_item(
+            icon_name: &str,
+            label_text: &str,
+            accel: Option<&str>,
+        ) -> gtk::Button {
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::Fill)
+                .hexpand(true)
+                .build();
 
-        let new_folder_item = gtk::Button::builder()
-            .icon_name("folder-new-symbolic")
-            .label("New Folder")
-            .has_frame(false)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .build();
-        new_folder_item.add_css_class("flat");
-        new_folder_item.add_css_class("limux-sidebar-add-menu-item");
+            let icon = gtk::Image::from_icon_name(icon_name);
+            icon.set_pixel_size(16);
+            content.append(&icon);
+
+            let label = gtk::Label::builder()
+                .label(label_text)
+                .halign(gtk::Align::Start)
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
+            content.append(&label);
+
+            if let Some(accel_str) = accel {
+                if let Some((key, mods)) = gtk::accelerator_parse(accel_str) {
+                    let accel_label = gtk::Label::new(Some(&gtk::accelerator_get_label(key, mods)));
+                    accel_label.add_css_class("limux-menu-item-accel");
+                    content.append(&accel_label);
+                }
+            }
+
+            let item = gtk::Button::builder()
+                .child(&content)
+                .has_frame(false)
+                .halign(gtk::Align::Fill)
+                .hexpand(true)
+                .build();
+            item.add_css_class("flat");
+            item.add_css_class("limux-sidebar-add-menu-item");
+            item
+        }
+
+        let new_ws_item = build_add_menu_item(
+            "list-add-symbolic",
+            "New Workspace",
+            Some("<Ctrl><Alt><Shift>n"),
+        );
+        let new_folder_item = build_add_menu_item("folder-new-symbolic", "New Folder", None);
 
         menu_box.append(&new_ws_item);
         menu_box.append(&new_folder_item);
