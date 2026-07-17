@@ -1334,11 +1334,6 @@ row:selected .limux-ws-star-btn {
     margin-top: 2px;
     margin-bottom: 2px;
 }
-.limux-folder-header-btn {
-    padding: 3px 6px 3px 3px;
-    border-radius: 6px;
-    min-height: 0;
-}
 .limux-sidebar list.navigation-sidebar row:hover {
     background: alpha(@window_fg_color, 0.08);
     border-radius: 6px;
@@ -1348,6 +1343,7 @@ row:selected .limux-ws-star-btn {
     border-radius: 6px;
 }
 .limux-folder-header-content {
+    padding: 3px 6px 3px 3px;
     min-height: 0;
 }
 .limux-folder-chevron,
@@ -1361,9 +1357,9 @@ row:selected .limux-ws-star-btn {
     font-weight: 600;
     letter-spacing: 0;
 }
-.limux-folder-header-btn:hover .limux-folder-chevron,
-.limux-folder-header-btn:hover .limux-folder-icon,
-.limux-folder-header-btn:hover .limux-folder-name {
+row:hover .limux-folder-chevron,
+row:hover .limux-folder-icon,
+row:hover .limux-folder-name {
     color: @window_fg_color;
 }
 .limux-sidebar-btn {
@@ -3163,7 +3159,9 @@ fn set_workspace_path_label(path_label: &gtk::Label, folder_path: Option<&str>) 
 }
 
 /// GNOME-style folder row: chevron + folder icon + name.
-fn build_folder_header_row(title: &str, collapsed: bool) -> (gtk::ListBoxRow, gtk::Button) {
+/// Returns the row plus a click gesture already attached to it — connect
+/// `connect_released` on the gesture to react to clicks, no separate button.
+fn build_folder_header_row(title: &str, collapsed: bool) -> (gtk::ListBoxRow, gtk::GestureClick) {
     // pan-end / pan-down match Nautilus expanders better than triangle glyphs.
     let chevron_name = if collapsed {
         "pan-end-symbolic"
@@ -3198,21 +3196,16 @@ fn build_folder_header_row(title: &str, collapsed: bool) -> (gtk::ListBoxRow, gt
     content.append(&folder_icon);
     content.append(&name);
 
-    let button = gtk::Button::builder()
-        .child(&content)
-        .halign(gtk::Align::Fill)
-        .hexpand(true)
-        .has_frame(false)
-        .build();
-    button.add_css_class("flat");
-    button.add_css_class("limux-folder-header-btn");
-
     let row = gtk::ListBoxRow::new();
     row.set_selectable(false);
     row.set_activatable(false);
     row.add_css_class("limux-folder-header-row");
-    row.set_child(Some(&button));
-    (row, button)
+    row.set_child(Some(&content));
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_PRIMARY);
+    row.add_controller(click.clone());
+    (row, click)
 }
 
 // ---------------------------------------------------------------------------
@@ -3401,11 +3394,11 @@ fn sync_sidebar_row_order(state: &State) {
 
     // Build folder sections (header always shown when a folder exists, even if empty).
     for (folder_id, title, collapsed, indices) in folder_sections {
-        let (header_row, header_button) = build_folder_header_row(&title, collapsed);
+        let (header_row, header_click) = build_folder_header_row(&title, collapsed);
         {
             let state = state.clone();
             let folder_id = folder_id.clone();
-            header_button.connect_clicked(move |_| {
+            header_click.connect_released(move |_, _, _, _| {
                 toggle_folder_collapsed(&state, &folder_id);
             });
         }
