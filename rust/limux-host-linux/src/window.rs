@@ -1238,6 +1238,10 @@ const BASE_CSS: &str = r#"
 .limux-sidebar list.navigation-sidebar {
     padding-top: 0;
 }
+.limux-sidebar list.navigation-sidebar row:not(.limux-ws-in-folder) {
+    margin-left: 1px;
+    margin-right: 3px;
+}
 .limux-sidebar-row-box {
     padding: 8px 6px 8px 3px;
     border-radius: 6px;
