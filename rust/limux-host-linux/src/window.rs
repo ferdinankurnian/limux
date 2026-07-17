@@ -1364,20 +1364,10 @@ row:selected .limux-ws-star-btn {
     font-weight: 600;
     letter-spacing: 0;
 }
-.limux-folder-count {
-    color: alpha(@window_fg_color, 0.45);
-    font-size: 12px;
-    font-weight: 500;
-    font-feature-settings: "tnum";
-    margin-start: 8px;
-}
 .limux-folder-header-btn:hover .limux-folder-chevron,
 .limux-folder-header-btn:hover .limux-folder-icon,
 .limux-folder-header-btn:hover .limux-folder-name {
     color: @window_fg_color;
-}
-.limux-folder-header-btn:hover .limux-folder-count {
-    color: alpha(@window_fg_color, 0.65);
 }
 .limux-sidebar-btn {
     background: alpha(@window_fg_color, 0.08);
@@ -3175,12 +3165,8 @@ fn set_workspace_path_label(path_label: &gtk::Label, folder_path: Option<&str>) 
     }
 }
 
-/// GNOME-style folder row: chevron + folder icon + name … count (space-between).
-fn build_folder_header_row(
-    title: &str,
-    collapsed: bool,
-    workspace_count: usize,
-) -> (gtk::ListBoxRow, gtk::Button) {
+/// GNOME-style folder row: chevron + folder icon + name.
+fn build_folder_header_row(title: &str, collapsed: bool) -> (gtk::ListBoxRow, gtk::Button) {
     // pan-end / pan-down match Nautilus expanders better than triangle glyphs.
     let chevron_name = if collapsed {
         "pan-end-symbolic"
@@ -3204,12 +3190,6 @@ fn build_folder_header_row(
         .build();
     name.add_css_class("limux-folder-name");
 
-    let count = gtk::Label::builder()
-        .label(workspace_count.to_string())
-        .halign(gtk::Align::End)
-        .build();
-    count.add_css_class("limux-folder-count");
-
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -3220,7 +3200,6 @@ fn build_folder_header_row(
     content.append(&chevron);
     content.append(&folder_icon);
     content.append(&name);
-    content.append(&count);
 
     let button = gtk::Button::builder()
         .child(&content)
@@ -3425,8 +3404,7 @@ fn sync_sidebar_row_order(state: &State) {
 
     // Build folder sections (header always shown when a folder exists, even if empty).
     for (folder_id, title, collapsed, indices) in folder_sections {
-        let (header_row, header_button) =
-            build_folder_header_row(&title, collapsed, indices.len());
+        let (header_row, header_button) = build_folder_header_row(&title, collapsed);
         {
             let state = state.clone();
             let folder_id = folder_id.clone();
