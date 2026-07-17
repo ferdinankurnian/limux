@@ -1401,9 +1401,10 @@ row:selected .limux-ws-star-btn {
 .limux-sidebar-add-btn {
     min-height: 0;
     min-width: 0;
-    padding: 0px 3px;
-    border-radius: 5px;
+    padding: 5px 7px;
+    border-radius: 6px;
     color: alpha(@window_fg_color, 0.55);
+    -gtk-icon-size: 18px;
 }
 .limux-sidebar-add-btn:hover {
     color: @window_fg_color;
