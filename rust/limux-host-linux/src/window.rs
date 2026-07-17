@@ -1325,7 +1325,7 @@ row:selected .limux-ws-star-btn {
 }
 .limux-folder-header-row {
     margin-top: 2px;
-    margin-bottom: 0;
+    margin-bottom: 2px;
 }
 .limux-folder-header-btn {
     padding: 3px 6px 3px 3px;
@@ -1334,6 +1334,14 @@ row:selected .limux-ws-star-btn {
 }
 .limux-folder-header-btn:hover {
     background: alpha(@window_fg_color, 0.08);
+}
+.limux-sidebar list.navigation-sidebar row:hover {
+    background: alpha(@window_fg_color, 0.08);
+    border-radius: 6px;
+}
+.limux-sidebar list.navigation-sidebar row:selected {
+    background: alpha(@window_fg_color, 0.08);
+    border-radius: 6px;
 }
 .limux-folder-header-content {
     min-height: 0;
