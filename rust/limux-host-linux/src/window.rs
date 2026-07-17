@@ -1239,7 +1239,7 @@ const BASE_CSS: &str = r#"
     padding-top: 0;
 }
 .limux-sidebar list.navigation-sidebar row:not(.limux-ws-in-folder) {
-    margin-left: 1px;
+    margin-left: 6px;
     margin-right: 3px;
 }
 .limux-sidebar-row-box {
