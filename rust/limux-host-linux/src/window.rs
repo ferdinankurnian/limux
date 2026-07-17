@@ -1324,10 +1324,11 @@ row:selected .limux-ws-star-btn {
     letter-spacing: 1px;
 }
 .limux-folder-header-row {
-    margin: 2px 3px 0 1px;
+    margin-top: 2px;
+    margin-bottom: 0;
 }
 .limux-folder-header-btn {
-    padding: 3px 6px;
+    padding: 3px 6px 3px 3px;
     border-radius: 6px;
     min-height: 0;
 }
