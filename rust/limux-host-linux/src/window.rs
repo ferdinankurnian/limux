@@ -94,9 +94,14 @@ pub(crate) struct AppState {
     sidebar_expanded_width: i32,
     /// User-defined sidebar folders (order = display order).
     sidebar_folders: Vec<SidebarFolder>,
+    /// Top-level sidebar display order: folder ids and loose (non-in-folder)
+    /// workspace ids, interleaved freely. Reconciled (self-healing) on every
+    /// `sync_sidebar_row_order` call, so it's safe if an entry is ever missed.
+    sidebar_top_order: Vec<String>,
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
+    folder_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
@@ -907,6 +912,7 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
                 collapsed: folder.collapsed,
             })
             .collect();
+        s.sidebar_top_order = loaded.state.sidebar.top_order.clone();
     }
 
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
@@ -1038,6 +1044,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             visible: sidebar_visible,
             width: sidebar_width,
             folders,
+            top_order: s.sidebar_top_order.clone(),
             // Kept for session JSON compat; ungrouped workspaces are no longer a collapsible section.
             ungrouped_collapsed: false,
         },
@@ -1244,7 +1251,7 @@ const BASE_CSS: &str = r#"
 }
 .limux-sidebar-row-box {
     padding: 8px 6px 8px 3px;
-    border-radius: 6px;
+    border-radius: 9px;
     margin: 2px 3px 2px 1px;
 }
 .limux-ws-in-folder {
@@ -1336,11 +1343,11 @@ row:selected .limux-ws-star-btn {
 }
 .limux-sidebar list.navigation-sidebar row:hover {
     background: alpha(@window_fg_color, 0.08);
-    border-radius: 6px;
+    border-radius: 9px;
 }
 .limux-sidebar list.navigation-sidebar row:selected {
     background: alpha(@window_fg_color, 0.08);
-    border-radius: 6px;
+    border-radius: 9px;
 }
 .limux-folder-header-content {
     padding: 3px 6px 3px 3px;
@@ -1750,9 +1757,11 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
         sidebar_folders: Vec::new(),
+        sidebar_top_order: Vec::new(),
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
+        folder_dragging: None,
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
@@ -3352,73 +3361,88 @@ fn toggle_folder_collapsed(state: &State, folder_id: &str) {
     request_session_save(state);
 }
 
-/// Rebuild sidebar list order: named folders (with members), then unassigned workspaces.
-/// Unassigned workspaces are plain rows — no virtual "Ungrouped" section.
+/// Rebuild sidebar list order from `sidebar_top_order` (folder ids and loose
+/// workspace ids, freely interleaved). The order is self-healing: stale
+/// entries are dropped and anything missing is appended, so it can never get
+/// the sidebar into a state where an item fails to render.
 fn sync_sidebar_row_order(state: &State) {
-    let s = state.borrow_mut();
+    let mut s = state.borrow_mut();
     while let Some(child) = s.sidebar_list.first_child() {
         s.sidebar_list.remove(&child);
     }
 
-    // (folder_id, title, collapsed, workspace indices) — folder_id is always Some for headers.
-    let mut folder_sections: Vec<(String, String, bool, Vec<usize>)> = s
-        .sidebar_folders
-        .iter()
-        .map(|folder| {
-            (
-                folder.id.clone(),
-                folder.name.clone(),
-                folder.collapsed,
-                Vec::new(),
-            )
-        })
-        .collect();
-    let mut unassigned: Vec<usize> = Vec::new();
-
+    // Figure out folder membership vs. loose workspaces.
+    let mut folder_members: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut loose_ids: Vec<String> = Vec::new();
     for (idx, workspace) in s.workspaces.iter().enumerate() {
         match workspace.folder_id.as_deref() {
-            Some(fid) => {
-                if let Some(section) = folder_sections
-                    .iter_mut()
-                    .find(|(id, _, _, _)| id.as_str() == fid)
-                {
-                    section.3.push(idx);
-                } else {
-                    // Dangling folder id — treat as unassigned.
-                    unassigned.push(idx);
+            Some(fid) if s.sidebar_folders.iter().any(|folder| folder.id == fid) => {
+                folder_members.entry(fid.to_string()).or_default().push(idx);
+            }
+            // None, or a dangling folder_id — render as a loose row.
+            _ => loose_ids.push(workspace.id.clone()),
+        }
+    }
+
+    // Self-heal top_order: drop anything stale, append anything missing.
+    let folder_ids: Vec<String> = s.sidebar_folders.iter().map(|f| f.id.clone()).collect();
+    let mut order: Vec<String> = s
+        .sidebar_top_order
+        .iter()
+        .filter(|id| folder_ids.contains(id) || loose_ids.contains(id))
+        .cloned()
+        .collect();
+    for fid in &folder_ids {
+        if !order.contains(fid) {
+            order.push(fid.clone());
+        }
+    }
+    for wid in &loose_ids {
+        if !order.contains(wid) {
+            order.push(wid.clone());
+        }
+    }
+    s.sidebar_top_order = order.clone();
+
+    let workspace_id_to_idx: HashMap<String, usize> = s
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(idx, workspace)| (workspace.id.clone(), idx))
+        .collect();
+
+    for entry_id in &order {
+        if let Some(folder) = s.sidebar_folders.iter().find(|f| &f.id == entry_id) {
+            let title = folder.name.clone();
+            let collapsed = folder.collapsed;
+            let folder_id = folder.id.clone();
+
+            let (header_row, header_click) = build_folder_header_row(&title, collapsed);
+            {
+                let state = state.clone();
+                let folder_id = folder_id.clone();
+                header_click.connect_released(move |_, _, _, _| {
+                    toggle_folder_collapsed(&state, &folder_id);
+                });
+            }
+            install_folder_header_interactions(state, &folder_id, &header_row);
+            install_folder_header_drag_source(state, &folder_id, &header_row);
+            s.sidebar_list.append(&header_row);
+
+            if let Some(indices) = folder_members.get(&folder_id) {
+                for &idx in indices {
+                    let row = s.workspaces[idx].sidebar_row.clone();
+                    row.set_visible(!collapsed);
+                    row.add_css_class("limux-ws-in-folder");
+                    s.sidebar_list.append(&row);
                 }
             }
-            None => unassigned.push(idx),
-        }
-    }
-
-    // Build folder sections (header always shown when a folder exists, even if empty).
-    for (folder_id, title, collapsed, indices) in folder_sections {
-        let (header_row, header_click) = build_folder_header_row(&title, collapsed);
-        {
-            let state = state.clone();
-            let folder_id = folder_id.clone();
-            header_click.connect_released(move |_, _, _, _| {
-                toggle_folder_collapsed(&state, &folder_id);
-            });
-        }
-        install_folder_header_interactions(state, &folder_id, &header_row);
-        s.sidebar_list.append(&header_row);
-
-        for idx in indices {
+        } else if let Some(&idx) = workspace_id_to_idx.get(entry_id) {
             let row = s.workspaces[idx].sidebar_row.clone();
-            row.set_visible(!collapsed);
-            row.add_css_class("limux-ws-in-folder");
+            row.set_visible(true);
+            row.remove_css_class("limux-ws-in-folder");
             s.sidebar_list.append(&row);
         }
-    }
-
-    // Loose workspaces: no section chrome, always visible.
-    for idx in unassigned {
-        let row = s.workspaces[idx].sidebar_row.clone();
-        row.set_visible(true);
-        row.remove_css_class("limux-ws-in-folder");
-        s.sidebar_list.append(&row);
     }
 
     let active_row = s
@@ -3435,18 +3459,40 @@ fn sync_sidebar_row_order(state: &State) {
 
 fn install_folder_header_interactions(state: &State, folder_id: &str, row: &gtk::ListBoxRow) {
     // Drop workspace onto folder header → assign to that folder.
+    // Drop another folder above/below it → reorder within the sidebar.
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
     drop_target.set_preload(true);
     {
         let row = row.clone();
-        drop_target.connect_motion(move |_, _, _| {
-            row.add_css_class("limux-tab-drop-target");
+        let state = state.clone();
+        let folder_id = folder_id.to_string();
+        drop_target.connect_motion(move |_, _, y| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
+            row.remove_css_class("limux-tab-drop-target");
+            let dragging_folder = state.borrow().folder_dragging.clone();
+            match dragging_folder {
+                Some(ref dragged_id) if dragged_id != &folder_id => {
+                    let h = row.height() as f64;
+                    if y < h / 2.0 {
+                        row.add_css_class("limux-drop-above");
+                    } else {
+                        row.add_css_class("limux-drop-below");
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    row.add_css_class("limux-tab-drop-target");
+                }
+            }
             gtk::gdk::DragAction::MOVE
         });
     }
     {
         let row = row.clone();
         drop_target.connect_leave(move |_| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
             row.remove_css_class("limux-tab-drop-target");
         });
     }
@@ -3454,11 +3500,25 @@ fn install_folder_header_interactions(state: &State, folder_id: &str, row: &gtk:
         let state = state.clone();
         let folder_id = folder_id.to_string();
         let row = row.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
+        drop_target.connect_drop(move |_, value, _, y| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
             row.remove_css_class("limux-tab-drop-target");
             let Ok(payload) = value.get::<String>() else {
                 return false;
             };
+            if let Some(dragged_folder_id) = payload.strip_prefix("folder:") {
+                if dragged_folder_id == folder_id {
+                    return false;
+                }
+                let drop_below = y >= row.height() as f64 / 2.0;
+                return reorder_sidebar_top_entry(
+                    &state,
+                    dragged_folder_id,
+                    &folder_id,
+                    drop_below,
+                );
+            }
             // Tab drags use "pane:tab"; ignore those on folder headers.
             if payload.contains(':') {
                 return false;
@@ -3480,6 +3540,70 @@ fn install_folder_header_interactions(state: &State, folder_id: &str, row: &gtk:
         });
     }
     row.add_controller(right_click);
+}
+
+/// Makes a folder header row itself draggable, so it can be reordered freely
+/// among other folders and loose workspaces. Payload is prefixed `folder:`
+/// to distinguish it from a workspace-id drag on the same STRING content type.
+fn install_folder_header_drag_source(state: &State, folder_id: &str, row: &gtk::ListBoxRow) {
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    {
+        let folder_id = folder_id.to_string();
+        drag_source.connect_prepare(move |_, _, _| {
+            let payload = glib::Value::from(&format!("folder:{folder_id}"));
+            Some(gtk::gdk::ContentProvider::for_value(&payload))
+        });
+    }
+    {
+        let state = state.clone();
+        let row = row.clone();
+        let folder_id = folder_id.to_string();
+        drag_source.connect_drag_begin(move |source, _| {
+            state.borrow_mut().folder_dragging = Some(folder_id.clone());
+            let icon = gtk::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&icon), 0, 0);
+        });
+    }
+    {
+        let state = state.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            state.borrow_mut().folder_dragging = None;
+        });
+    }
+    row.add_controller(drag_source);
+}
+
+/// Reposition a folder or loose workspace within `sidebar_top_order`,
+/// dropping `source_id` immediately above/below `target_id`. Works
+/// regardless of whether either id is a folder or a loose workspace.
+fn reorder_sidebar_top_entry(
+    state: &State,
+    source_id: &str,
+    target_id: &str,
+    drop_below: bool,
+) -> bool {
+    if source_id == target_id {
+        return false;
+    }
+    {
+        let mut s = state.borrow_mut();
+        let Some(source_pos) = s.sidebar_top_order.iter().position(|id| id == source_id) else {
+            return false;
+        };
+        let entry = s.sidebar_top_order.remove(source_pos);
+        let target_pos = s
+            .sidebar_top_order
+            .iter()
+            .position(|id| id == target_id)
+            .unwrap_or(s.sidebar_top_order.len());
+        let insert_at = if drop_below { target_pos + 1 } else { target_pos };
+        let insert_at = insert_at.min(s.sidebar_top_order.len());
+        s.sidebar_top_order.insert(insert_at, entry);
+    }
+    sync_sidebar_row_order(state);
+    request_session_save(state);
+    true
 }
 
 fn move_workspace_to_folder(state: &State, workspace_id: &str, folder_id: Option<&str>) -> bool {
@@ -4192,6 +4316,18 @@ fn install_workspace_row_interactions(
             r.remove_css_class("limux-drop-below");
             r.remove_css_class("limux-tab-drop-target");
 
+            let dragging_folder = state.borrow().folder_dragging.clone();
+            if dragging_folder.is_some() {
+                // Reordering a folder past this workspace row — just show the
+                // insertion indicator, skip the "hover to switch tab" timer.
+                if y < h / 2.0 {
+                    r.add_css_class("limux-drop-above");
+                } else {
+                    r.add_css_class("limux-drop-below");
+                }
+                return gtk::gdk::DragAction::MOVE;
+            }
+
             let dragged_workspace = state.borrow().workspace_dragging.clone();
             match dragged_workspace {
                 Some(ref dragged_workspace_id) if dragged_workspace_id != &target_workspace_id => {
@@ -4274,6 +4410,15 @@ fn install_workspace_row_interactions(
                 source.remove();
             }
             if let Ok(payload) = value.get::<String>() {
+                if let Some(dragged_folder_id) = payload.strip_prefix("folder:") {
+                    let drop_below = y >= r.height() as f64 / 2.0;
+                    return reorder_sidebar_top_entry(
+                        &state,
+                        dragged_folder_id,
+                        &target_workspace_id,
+                        drop_below,
+                    );
+                }
                 if payload.contains(':') {
                     return handle_tab_drop_to_workspace(&state, &target_workspace_id, &payload);
                 }

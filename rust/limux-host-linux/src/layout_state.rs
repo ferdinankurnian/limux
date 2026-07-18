@@ -46,6 +46,11 @@ pub struct SidebarState {
     /// Distinct from each workspace's `folder_path` (project/cwd path).
     #[serde(default)]
     pub folders: Vec<SidebarFolderState>,
+    /// Top-level display order: folder ids and loose (non-in-folder) workspace
+    /// ids, interleaved. Missing/stale entries are self-healed at runtime, so
+    /// old session files without this field just fall back to "folders first".
+    #[serde(default)]
+    pub top_order: Vec<String>,
     /// Legacy field: unassigned workspaces are no longer a collapsible section.
     /// Kept so older session JSON still deserializes; always ignored at runtime.
     #[serde(default)]
@@ -237,6 +242,7 @@ impl Default for SidebarState {
             visible: default_sidebar_visible(),
             width: default_sidebar_width(),
             folders: Vec::new(),
+            top_order: Vec::new(),
             ungrouped_collapsed: false,
         }
     }
