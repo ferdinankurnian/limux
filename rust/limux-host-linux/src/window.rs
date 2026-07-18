@@ -67,6 +67,10 @@ struct Workspace {
     folder_path: Option<String>,
     /// Optional sidebar folder id for UI grouping (`None` = not in a folder).
     folder_id: Option<String>,
+    /// Optional user-picked custom icon image path, shown in the sidebar row.
+    icon_path: Option<String>,
+    /// Icon image widget in the sidebar row (hidden when no custom icon is set).
+    icon_image: gtk::Image,
     /// Path label shown below workspace name in sidebar.
     #[allow(dead_code)]
     path_label: gtk::Label,
@@ -1022,6 +1026,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 cwd,
                 folder_path,
                 folder_id: workspace.folder_id.clone(),
+                icon_path: workspace.icon_path.clone(),
                 layout,
             }
         })
@@ -1241,6 +1246,10 @@ const BASE_CSS: &str = r#"
     background-color: @window_bg_color;
     color: @window_fg_color;
     border-right: 1px solid alpha(@window_fg_color, 0.08);
+}
+.limux-ws-icon {
+    margin-end: 8px;
+    border-radius: 5px;
 }
 .limux-sidebar list.navigation-sidebar {
     padding-top: 0;
@@ -3081,7 +3090,15 @@ fn build_sidebar_row(
     gtk::Label,
     gtk::Label,
     gtk::Label,
+    gtk::Image,
 ) {
+    let icon_image = gtk::Image::new();
+    icon_image.add_css_class("limux-ws-icon");
+    icon_image.set_pixel_size(20);
+    icon_image.set_visible(false);
+    icon_image.set_valign(gtk::Align::Center);
+    icon_image.set_overflow(gtk::Overflow::Hidden);
+
     let notify_dot = gtk::Label::builder().label("\u{25CF}").build();
     notify_dot.add_css_class("limux-notify-dot-hidden");
 
@@ -3102,6 +3119,7 @@ fn build_sidebar_row(
     favorite_button.set_tooltip_text(Some("Favorite workspace"));
 
     let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    top_row.append(&icon_image);
     top_row.append(&notify_dot);
     top_row.append(&name_label);
     top_row.append(&favorite_button);
@@ -3141,6 +3159,7 @@ fn build_sidebar_row(
         notify_dot,
         notify_label,
         path_label,
+        icon_image,
     )
 }
 
@@ -3165,6 +3184,92 @@ fn set_workspace_path_label(path_label: &gtk::Label, folder_path: Option<&str>) 
         path_label.set_tooltip_text(None::<&str>);
         path_label.set_label("");
     }
+}
+
+/// Load (or clear) a workspace's custom sidebar icon image. Missing/unreadable
+/// files just fall back to no icon rather than erroring.
+fn apply_workspace_icon(icon_image: &gtk::Image, icon_path: Option<&str>) {
+    match icon_path {
+        Some(path) if std::path::Path::new(path).is_file() => {
+            icon_image.set_from_file(Some(path));
+            icon_image.set_visible(true);
+        }
+        _ => {
+            icon_image.clear();
+            icon_image.set_visible(false);
+        }
+    }
+}
+
+/// Directory custom workspace icon images are copied into.
+fn workspace_icons_dir() -> Option<std::path::PathBuf> {
+    let mut dir = dirs::data_dir()?;
+    dir.push("limux");
+    dir.push("workspace-icons");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Update a workspace's stored icon path, refresh its row, and persist.
+fn set_workspace_icon(state: &State, workspace_id: &str, icon_path: Option<String>) {
+    let s = state.borrow();
+    let Some(workspace) = s.workspaces.iter().find(|w| w.id == workspace_id) else {
+        return;
+    };
+    apply_workspace_icon(&workspace.icon_image, icon_path.as_deref());
+    drop(s);
+    let mut s = state.borrow_mut();
+    if let Some(workspace) = s.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+        workspace.icon_path = icon_path;
+    }
+    drop(s);
+    request_session_save(state);
+}
+
+/// Open a file picker for an image, copy the chosen file into the app's
+/// per-workspace icon store, and apply it as this workspace's sidebar icon.
+fn begin_set_workspace_icon(state: &State, workspace_id: &str) {
+    let picker = gtk::FileDialog::builder()
+        .title("Choose Workspace Icon")
+        .accept_label("Choose")
+        .modal(true)
+        .build();
+
+    let image_filter = gtk::FileFilter::new();
+    image_filter.set_name(Some("Images"));
+    image_filter.add_pixbuf_formats();
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&image_filter);
+    picker.set_filters(Some(&filters));
+    picker.set_default_filter(Some(&image_filter));
+
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    let transient_for = active_window(&state);
+    picker.open(transient_for.as_ref(), None::<&gio::Cancellable>, move |result| {
+        let Ok(file) = result else {
+            return;
+        };
+        let Some(source_path) = file.path() else {
+            return;
+        };
+        let Some(mut dest_dir) = workspace_icons_dir() else {
+            return;
+        };
+        let ext = source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("png");
+        dest_dir.push(format!("{workspace_id}.{ext}"));
+        if std::fs::copy(&source_path, &dest_dir).is_err() {
+            return;
+        }
+        set_workspace_icon(&state, &workspace_id, Some(dest_dir.to_string_lossy().into_owned()));
+    });
+}
+
+fn remove_workspace_icon(state: &State, workspace_id: &str) {
+    set_workspace_icon(state, workspace_id, None);
 }
 
 /// GNOME-style folder row: chevron + folder icon + name.
@@ -3288,6 +3393,14 @@ fn next_active_workspace_index(
 /// Workspace row context menu: rename / delete only.
 /// Folder create is via the header + menu; move into a folder is drag-and-drop.
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
+    let has_icon = state
+        .borrow()
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace_id)
+        .map(|w| w.icon_path.is_some())
+        .unwrap_or(false);
+
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     menu_box.set_margin_top(4);
     menu_box.set_margin_bottom(4);
@@ -3296,11 +3409,19 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
 
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
+    let icon_btn = gtk::Button::with_label("Set Icon…");
+    icon_btn.add_css_class("flat");
+    let remove_icon_btn = gtk::Button::with_label("Remove Icon");
+    remove_icon_btn.add_css_class("flat");
     let delete_btn = gtk::Button::with_label("Delete");
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
     menu_box.append(&rename_btn);
+    menu_box.append(&icon_btn);
+    if has_icon {
+        menu_box.append(&remove_icon_btn);
+    }
     menu_box.append(&delete_btn);
 
     let popover = gtk::Popover::new();
@@ -3315,6 +3436,24 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         rename_btn.connect_clicked(move |_| {
             pop.popdown();
             begin_workspace_inline_rename(&state, &ws_id);
+        });
+    }
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        icon_btn.connect_clicked(move |_| {
+            pop.popdown();
+            begin_set_workspace_icon(&state, &ws_id);
+        });
+    }
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        remove_icon_btn.connect_clicked(move |_| {
+            pop.popdown();
+            remove_workspace_icon(&state, &ws_id);
         });
     }
     {
@@ -4246,7 +4385,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
 
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, icon_image) =
         build_sidebar_row(&seed.name, seed.folder_path.as_deref());
     let row_clone = row.clone();
     {
@@ -4269,6 +4408,8 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             folder_id: None,
+            icon_path: None,
+            icon_image,
             path_label,
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
@@ -4725,6 +4866,7 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
         folder_id: None,
+        icon_path: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
     add_workspace_from_state(state, &workspace);
@@ -5364,9 +5506,11 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
     stack.add_named(&root, Some(&stack_name));
 
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, icon_image) =
         build_sidebar_row(&workspace.name, workspace.folder_path.as_deref());
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
+
+    apply_workspace_icon(&icon_image, workspace.icon_path.as_deref());
 
     let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(workspace.cwd.clone()));
     let ws = Workspace {
@@ -5384,6 +5528,8 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         cwd,
         folder_path: workspace.folder_path.clone(),
         folder_id: workspace.folder_id.clone(),
+        icon_path: workspace.icon_path.clone(),
+        icon_image,
         path_label,
     };
 

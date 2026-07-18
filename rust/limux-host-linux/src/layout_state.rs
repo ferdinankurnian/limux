@@ -86,6 +86,9 @@ pub struct WorkspaceState {
     /// Optional sidebar folder id for UI grouping. `None` means not in a folder.
     #[serde(default)]
     pub folder_id: Option<String>,
+    /// Optional path to a user-picked custom icon image for this workspace.
+    #[serde(default)]
+    pub icon_path: Option<String>,
     pub layout: LayoutNodeState,
 }
 
@@ -504,6 +507,7 @@ impl AppSessionState {
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
                     folder_id: None,
+                    icon_path: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
