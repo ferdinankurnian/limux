@@ -3226,7 +3226,25 @@ fn set_workspace_icon(state: &State, workspace_id: &str, icon_path: Option<Strin
     request_session_save(state);
 }
 
-/// Open a file picker for an image, copy the chosen file into the app's
+/// Load an image from disk, center-crop it to a square (cropping the longer
+/// axis, like CSS `object-fit: cover`), and scale to `size`x`size`.
+fn crop_and_scale_icon_square(
+    source_path: &std::path::Path,
+    size: i32,
+) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file(source_path).ok()?;
+    let (w, h) = (pixbuf.width(), pixbuf.height());
+    let side = w.min(h);
+    if side <= 0 {
+        return None;
+    }
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    let square = pixbuf.new_subpixbuf(x, y, side, side);
+    square.scale_simple(size, size, gtk::gdk_pixbuf::InterpType::Bilinear)
+}
+
+/// Open a file picker for an image, center-crop + scale it into the app's
 /// per-workspace icon store, and apply it as this workspace's sidebar icon.
 fn begin_set_workspace_icon(state: &State, workspace_id: &str) {
     let picker = gtk::FileDialog::builder()
@@ -3256,12 +3274,15 @@ fn begin_set_workspace_icon(state: &State, workspace_id: &str) {
         let Some(mut dest_dir) = workspace_icons_dir() else {
             return;
         };
-        let ext = source_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("png");
-        dest_dir.push(format!("{workspace_id}.{ext}"));
-        if std::fs::copy(&source_path, &dest_dir).is_err() {
+        // Always saved as PNG — the source format no longer matters once
+        // it's been cropped/scaled.
+        dest_dir.push(format!("{workspace_id}.png"));
+        let cropped = crop_and_scale_icon_square(&source_path, 128);
+        let saved = match &cropped {
+            Some(pixbuf) => pixbuf.savev(&dest_dir, "png", &[]).is_ok(),
+            None => std::fs::copy(&source_path, &dest_dir).is_ok(),
+        };
+        if !saved {
             return;
         }
         set_workspace_icon(&state, &workspace_id, Some(dest_dir.to_string_lossy().into_owned()));
