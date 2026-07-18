@@ -3383,6 +3383,12 @@ fn sync_sidebar_row_order(state: &State) {
             _ => loose_ids.push(workspace.id.clone()),
         }
     }
+    // Favorited workspaces float to the top within their own grouping
+    // (their folder's members, or the loose section) without disturbing
+    // relative order among same-favorite-status siblings.
+    for indices in folder_members.values_mut() {
+        indices.sort_by_key(|&idx| !s.workspaces[idx].favorite);
+    }
 
     // Self-heal top_order: drop anything stale, append anything missing.
     let folder_ids: Vec<String> = s.sidebar_folders.iter().map(|f| f.id.clone()).collect();
@@ -3402,6 +3408,26 @@ fn sync_sidebar_row_order(state: &State) {
             order.push(wid.clone());
         }
     }
+
+    // Favorite-sort the loose slots in place; folder entries (and their
+    // positions among loose items) are left exactly where they are.
+    let favorite_of: HashMap<String, bool> = s
+        .workspaces
+        .iter()
+        .map(|workspace| (workspace.id.clone(), workspace.favorite))
+        .collect();
+    let loose_slots: Vec<usize> = order
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| !folder_ids.contains(id))
+        .map(|(i, _)| i)
+        .collect();
+    let mut loose_sorted: Vec<String> = loose_slots.iter().map(|&i| order[i].clone()).collect();
+    loose_sorted.sort_by_key(|id| !favorite_of.get(id).copied().unwrap_or(false));
+    for (slot, id) in loose_slots.into_iter().zip(loose_sorted) {
+        order[slot] = id;
+    }
+
     s.sidebar_top_order = order.clone();
 
     let workspace_id_to_idx: HashMap<String, usize> = s
