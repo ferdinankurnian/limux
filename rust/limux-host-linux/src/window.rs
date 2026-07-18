@@ -4084,6 +4084,31 @@ fn reorder_workspace_by_id(
             .map(|workspace| workspace.sidebar_row.clone());
         (s.sidebar_list.clone(), row_to_select)
     };
+
+    // Keep sidebar_top_order in sync: if the moved workspace ended up loose,
+    // place it next to the drop target in the loose sequence; if it ended up
+    // inside a folder, it's no longer a top-level entry, so drop it.
+    {
+        let mut s = state.borrow_mut();
+        let is_loose = s
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == source_id)
+            .map(|workspace| workspace.folder_id.is_none())
+            .unwrap_or(false);
+        s.sidebar_top_order.retain(|id| id != source_id);
+        if is_loose {
+            let target_pos = s
+                .sidebar_top_order
+                .iter()
+                .position(|id| id == target_id)
+                .unwrap_or(s.sidebar_top_order.len());
+            let insert_at = if drop_below { target_pos + 1 } else { target_pos };
+            let insert_at = insert_at.min(s.sidebar_top_order.len());
+            s.sidebar_top_order.insert(insert_at, source_id.to_string());
+        }
+    }
+
     sync_sidebar_row_order(state);
 
     if let Some(row) = row_to_select {
