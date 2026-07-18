@@ -3569,24 +3569,19 @@ fn sync_sidebar_row_order(state: &State) {
         }
     }
 
-    // Favorite-sort the loose slots in place; folder entries (and their
-    // positions among loose items) are left exactly where they are.
+    // Favorited loose workspaces always form the very top of the sidebar as
+    // a contiguous block — folders can be dragged anywhere else, but never
+    // above or into that block, even if the user drops one there.
     let favorite_of: HashMap<String, bool> = s
         .workspaces
         .iter()
         .map(|workspace| (workspace.id.clone(), workspace.favorite))
         .collect();
-    let loose_slots: Vec<usize> = order
-        .iter()
-        .enumerate()
-        .filter(|(_, id)| !folder_ids.contains(id))
-        .map(|(i, _)| i)
-        .collect();
-    let mut loose_sorted: Vec<String> = loose_slots.iter().map(|&i| order[i].clone()).collect();
-    loose_sorted.sort_by_key(|id| !favorite_of.get(id).copied().unwrap_or(false));
-    for (slot, id) in loose_slots.into_iter().zip(loose_sorted) {
-        order[slot] = id;
-    }
+    let (favorited_loose, rest): (Vec<String>, Vec<String>) = order.into_iter().partition(|id| {
+        !folder_ids.contains(id) && favorite_of.get(id).copied().unwrap_or(false)
+    });
+    let mut order = favorited_loose;
+    order.extend(rest);
 
     s.sidebar_top_order = order.clone();
 
