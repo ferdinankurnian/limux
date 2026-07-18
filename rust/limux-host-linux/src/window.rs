@@ -4329,7 +4329,7 @@ fn install_workspace_row_interactions(
             let mut s = state.borrow_mut();
             s.workspace_dragging = Some(workspace_id.clone());
             s.add_btn_popover.popdown();
-            s.add_btn.set_icon_name("\u{1F5D1}\u{FE0E}");
+            s.add_btn.set_icon_name("user-trash-symbolic");
             s.add_btn.add_css_class("limux-sidebar-btn-trash");
             drop(s);
             pane::set_workspace_dragging_all(true);
