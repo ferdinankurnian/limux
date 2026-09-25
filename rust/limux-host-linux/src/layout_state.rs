@@ -445,6 +445,20 @@ pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
     state
 }
 
+/// Sunset helper for the legacy sidebar folder-grouping feature.
+///
+/// Drops every sidebar folder (and the top-level display order) and moves all
+/// grouped workspaces back to loose workspaces. Applied on startup and when
+/// the `legacy_folder_grouping` setting is off, so workspaces grouped by
+/// older builds always come back as a flat list.
+pub fn ungroup_all_workspaces(state: &mut AppSessionState) {
+    state.sidebar.folders.clear();
+    state.sidebar.top_order.clear();
+    for workspace in &mut state.workspaces {
+        workspace.folder_id = None;
+    }
+}
+
 /// Keep folder metadata consistent and clear dangling workspace assignments.
 fn normalize_sidebar_folders(state: &mut AppSessionState) {
     let mut seen_ids = std::collections::HashSet::new();
@@ -1879,6 +1893,57 @@ mod tests {
         // Project path is independent of sidebar folder assignment.
         assert_eq!(
             normalized.workspaces[0].folder_path.as_deref(),
+            Some("/tmp/project")
+        );
+    }
+
+    #[test]
+    fn ungroup_all_workspaces_flattens_grouped_session() {
+        let mut state = AppSessionState {
+            sidebar: SidebarState {
+                folders: vec![SidebarFolderState {
+                    id: "folder-1".to_string(),
+                    name: "Archives".to_string(),
+                    collapsed: false,
+                }],
+                top_order: vec!["folder-1".to_string(), "ws-loose".to_string()],
+                ..SidebarState::default()
+            },
+            workspaces: vec![
+                WorkspaceState {
+                    id: Some("ws-1".to_string()),
+                    name: "grouped".to_string(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: Some("/tmp/project".to_string()),
+                    folder_id: Some("folder-1".to_string()),
+                    icon_path: None,
+                    autostart_command: None,
+                    layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp/project"))),
+                },
+                WorkspaceState {
+                    id: Some("ws-loose".to_string()),
+                    name: "loose".to_string(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                    folder_id: None,
+                    icon_path: None,
+                    autostart_command: None,
+                    layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+                },
+            ],
+            ..AppSessionState::default()
+        };
+
+        ungroup_all_workspaces(&mut state);
+
+        assert!(state.sidebar.folders.is_empty());
+        assert!(state.sidebar.top_order.is_empty());
+        assert!(state.workspaces.iter().all(|w| w.folder_id.is_none()));
+        // Project path is independent of sidebar folder assignment.
+        assert_eq!(
+            state.workspaces[0].folder_path.as_deref(),
             Some("/tmp/project")
         );
     }

@@ -86,6 +86,10 @@ pub struct AppConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub keep_open_after_last_terminal_closes: bool,
+    /// Deprecated sidebar folder grouping. Off by default; when off, all
+    /// workspaces are shown as a flat list and existing folder assignments
+    /// are cleared on load.
+    pub legacy_folder_grouping: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -414,6 +418,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|workspace| workspace.get("keep_open_after_last_terminal_closes"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
+    let legacy_folder_grouping = workspace
+        .and_then(|workspace| workspace.get("legacy_folder_grouping"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -478,6 +486,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         workspace: WorkspaceConfig {
             keep_open_after_last_terminal_closes,
+            legacy_folder_grouping,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -538,6 +547,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "keep_open_after_last_terminal_closes": config
                 .workspace
                 .keep_open_after_last_terminal_closes,
+            "legacy_folder_grouping": config.workspace.legacy_folder_grouping,
         }),
     );
     root.insert(
@@ -681,7 +691,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "hover_terminal_focus": false
         },
         "workspace": {
-            "keep_open_after_last_terminal_closes": false
+            "keep_open_after_last_terminal_closes": false,
+            "legacy_folder_grouping": false
         },
         "notifications": {
             "enabled": true,
@@ -1064,6 +1075,31 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert!(loaded.config.workspace.keep_open_after_last_terminal_closes);
+    }
+
+    #[test]
+    fn legacy_folder_grouping_defaults_off_and_round_trips() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"workspace": {}}"#).expect("write config");
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warnings.is_empty());
+        assert!(!loaded.config.workspace.legacy_folder_grouping);
+
+        let mut config = AppConfig::default();
+        config.workspace.legacy_folder_grouping = true;
+        save_to_path(&path, &config).expect("save config");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["workspace"]["legacy_folder_grouping"],
+            Value::Bool(true)
+        );
+        let reloaded = load_from_path(&path);
+        assert!(reloaded.config.workspace.legacy_folder_grouping);
     }
 
     #[test]

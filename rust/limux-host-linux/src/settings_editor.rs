@@ -307,6 +307,19 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     keep_workspace_open_row.set_activatable_widget(Some(&keep_workspace_open_switch));
     group.add(&keep_workspace_open_row);
 
+    let legacy_folders_row = adw::ActionRow::builder()
+        .title("Folder grouping (legacy)")
+        .subtitle("Deprecated sidebar folders for workspaces. When off, every workspace is shown as a flat list")
+        .build();
+    legacy_folders_row.set_title_lines(1);
+    legacy_folders_row.set_subtitle_lines(2);
+    let legacy_folders_switch = gtk::Switch::new();
+    legacy_folders_switch.set_active(input.config.borrow().workspace.legacy_folder_grouping);
+    legacy_folders_switch.set_valign(gtk::Align::Center);
+    legacy_folders_row.add_suffix(&legacy_folders_switch);
+    legacy_folders_row.set_activatable_widget(Some(&legacy_folders_switch));
+    group.add(&legacy_folders_row);
+
     let auto_copy_row = adw::ActionRow::builder()
         .title("Copy selection automatically")
         .subtitle("Copy selected terminal text to the regular clipboard")
@@ -487,6 +500,27 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             apply_config_change(&config, &*on_changed, move |c| {
                 c.workspace.keep_open_after_last_terminal_closes = keep_open;
             });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        legacy_folders_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let legacy_folder_grouping = switch.is_active();
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.workspace.legacy_folder_grouping = legacy_folder_grouping;
+            })
+            .workspace
+            .legacy_folder_grouping;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
         });
     }
     {

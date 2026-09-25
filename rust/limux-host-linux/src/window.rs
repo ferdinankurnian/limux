@@ -108,6 +108,9 @@ pub(crate) struct AppState {
     sidebar_list: gtk::ListBox,
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
+    /// Legacy WORKSPACES title row with the + menu. Only visible while the
+    /// deprecated folder-grouping setting is on.
+    sidebar_title: gtk::Box,
     add_btn: gtk::Button,
     add_btn_popover: gtk::Popover,
     new_ws_btn: gtk::Button,
@@ -1116,6 +1119,19 @@ fn stop_session_saves_for_shutdown(state: &State) {
 }
 
 fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
+    // Legacy folder grouping is off by default: flatten workspaces grouped
+    // by older builds so they come back as loose rows. The flattened state
+    // is persisted by the save at the end of this function.
+    let legacy_enabled = state
+        .borrow()
+        .config
+        .borrow()
+        .workspace
+        .legacy_folder_grouping;
+    if !legacy_enabled {
+        layout_state::ungroup_all_workspaces(&mut loaded.state);
+    }
+
     suspend_persistence(state, true);
     {
         let mut s = state.borrow_mut();
@@ -2308,6 +2324,7 @@ pub fn build_window(app: &adw::Application) {
     // Legacy folder-grouping title row (WORKSPACES + add menu). Visibility is
     // driven by the legacy setting; defaults to hidden (see apply_legacy_* below).
     sidebar.append(&sidebar_title);
+    sidebar_title.set_visible(config.borrow().workspace.legacy_folder_grouping);
     sidebar.append(&sidebar_scroll);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
@@ -2344,6 +2361,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_list: sidebar_list.clone(),
         sidebar_shell: sidebar_shell.clone(),
         sidebar_handle: sidebar_handle.clone(),
+        sidebar_title: sidebar_title.clone(),
         add_btn: add_btn.clone(),
         add_btn_popover: add_btn_popover.clone(),
         new_ws_btn: new_ws_btn.clone(),
@@ -3249,6 +3267,9 @@ fn handle_config_change(
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
         sync_workspace_path_visibility(state, updated.appearance.show_workspace_path);
     }
+    if previous.workspace.legacy_folder_grouping != updated.workspace.legacy_folder_grouping {
+        apply_legacy_folder_grouping(state, updated.workspace.legacy_folder_grouping);
+    }
     if previous.interface.window_controls_side != updated.interface.window_controls_side
         || previous.interface.show_top_bar != updated.interface.show_top_bar
         || previous.interface.show_workspace_indicators
@@ -3264,6 +3285,9 @@ fn handle_config_change(
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
             sync_workspace_path_visibility(state, previous.appearance.show_workspace_path);
+        }
+        if previous.workspace.legacy_folder_grouping != updated.workspace.legacy_folder_grouping {
+            apply_legacy_folder_grouping(state, previous.workspace.legacy_folder_grouping);
         }
         apply_top_bar_mode(state);
 
@@ -4348,6 +4372,35 @@ fn sync_workspace_path_visibility(state: &State, show_workspace_path: bool) {
             show_workspace_path,
         ));
     }
+}
+
+/// Apply the deprecated folder-grouping setting to the sidebar.
+///
+/// When off, the legacy title row (with its New Folder entry) stays hidden
+/// and every grouped workspace is flattened back to a loose workspace; the
+/// flattened state is persisted through the normal session save.
+fn apply_legacy_folder_grouping(state: &State, enabled: bool) {
+    let title = state.borrow().sidebar_title.clone();
+    title.set_visible(enabled);
+    if enabled {
+        sync_sidebar_row_order(state);
+    } else {
+        ungroup_sidebar_state(state);
+        request_session_save(state);
+    }
+}
+
+/// Clear in-memory folder assignments so the sidebar renders flat.
+fn ungroup_sidebar_state(state: &State) {
+    {
+        let mut s = state.borrow_mut();
+        s.sidebar_folders.clear();
+        s.sidebar_top_order.clear();
+        for workspace in &mut s.workspaces {
+            workspace.folder_id = None;
+        }
+    }
+    sync_sidebar_row_order(state);
 }
 
 /// Abbreviate a path by replacing the home directory with ~.
