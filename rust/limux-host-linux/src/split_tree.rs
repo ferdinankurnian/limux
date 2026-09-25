@@ -37,6 +37,16 @@ impl SplitNode {
         matches!(self, SplitNode::Leaf { .. })
     }
 
+    fn collect_panes(&self, panes: &mut Vec<gtk::Widget>) {
+        match self {
+            SplitNode::Leaf { pane_widget } => panes.push(pane_widget.clone()),
+            SplitNode::Split { left, right, .. } => {
+                left.collect_panes(panes);
+                right.collect_panes(panes);
+            }
+        }
+    }
+
     /// Find the leaf containing `target` and replace it with `replacement`.
     pub(crate) fn replace(&mut self, target: &gtk::Widget, replacement: SplitNode) -> bool {
         match self {
@@ -197,6 +207,14 @@ impl SplitTreeContainer {
         self.tree.borrow().is_leaf()
     }
 
+    pub(crate) fn retire_panes(&self) {
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        for pane_widget in panes {
+            pane::retire_pane(&pane_widget);
+        }
+    }
+
     pub(crate) fn toggle_zoom(self: &Rc<Self>, target: &gtk::Widget) -> bool {
         if self.zoomed_pane.borrow().is_some() {
             self.restore_zoom();
@@ -205,6 +223,21 @@ impl SplitTreeContainer {
             self.zoom_pane(target);
             true
         }
+    }
+
+    pub(crate) fn reveal_pane(self: &Rc<Self>, target: &gtk::Widget) -> bool {
+        let should_restore = self
+            .zoomed_pane
+            .borrow()
+            .as_ref()
+            .is_some_and(|zoomed| zoomed != target);
+        if !should_restore {
+            return false;
+        }
+        self.zoomed_pane.borrow_mut().take();
+        *self.last_focused.borrow_mut() = Some(target.clone());
+        self.trigger_rebuild();
+        true
     }
 
     fn zoom_pane(self: &Rc<Self>, target: &gtk::Widget) {
@@ -359,6 +392,7 @@ impl SplitTreeContainer {
                 focused.grab_focus();
             }
         }
+        crate::window::apply_top_bar_mode(&self.state);
     }
 
     fn save_focus(&self) {
@@ -452,9 +486,14 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .orientation(*orientation)
                 .hexpand(true)
                 .vexpand(true)
+                // Allow either child to be shrunk below its minimum size so
+                // the saved split ratio (e.g. 50/50) is honored even when one
+                // pane has wider tabs than the other. Without this, gtk::Paned
+                // clamps the position to respect the larger pane's minimum
+                // width, producing visibly uneven splits.
+                .shrink_start_child(true)
+                .shrink_end_child(true)
                 .build();
-            paned.set_shrink_start_child(false);
-            paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);
             paned.set_resize_end_child(true);
 
@@ -462,43 +501,107 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             update_split_ratio_state(&paned, ratio_val);
             attach_split_position_persistence(state, &paned);
 
-            // Flag to suppress position_notify during programmatic set_position calls
-            // (initial layout and workspace re-map). Without this, set_position triggers
-            // position_notify which recalculates the ratio from the not-yet-stable pixel
-            // position, corrupting the stored ratio.
-            let applying = Rc::new(Cell::new(false));
-
-            // Wire resize drags back to the shared ratio cell in the data model.
-            let shared_ratio = ratio.clone();
-            let applying_for_notify = applying.clone();
-            paned.connect_position_notify(move |paned| {
-                if applying_for_notify.get() {
-                    return;
-                }
-                let allocation = paned.allocation();
-                let size = if paned.orientation() == gtk::Orientation::Horizontal {
-                    allocation.width()
-                } else {
-                    allocation.height()
-                };
-                let new_ratio = layout_state::snapshot_split_ratio(
-                    paned.position(),
-                    size,
-                    Some(*shared_ratio.borrow()),
-                );
-                *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
-            });
+            install_split_ratio_tracking(&paned, ratio);
 
             let left_widget = build_widget_tree(left, state);
             let right_widget = build_widget_tree(right, state);
             paned.set_start_child(Some(&left_widget));
             paned.set_end_child(Some(&right_widget));
 
-            apply_split_ratio_after_layout(&paned, *orientation, ratio.clone(), applying);
-
             paned.upcast()
         }
     }
+}
+
+fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
+    // Flag to suppress position_notify during programmatic set_position calls
+    // (initial layout and workspace re-map). Without this, set_position triggers
+    // position_notify which recalculates the ratio from the not-yet-stable pixel
+    // position, corrupting the stored ratio.
+    let applying = Rc::new(Cell::new(false));
+
+    // Track the width we last saw, so position_notify can distinguish
+    // user drags (width unchanged → recompute ratio) from width-driven
+    // auto-adjust (width changed → preserve ratio by re-applying
+    // position = ratio * new_width). Without this, opening the
+    // sidebar (which shrinks the inner paned's width) silently skews
+    // the saved ratio because GtkPaned's position is absolute pixels.
+    let last_size = Rc::new(Cell::new(0i32));
+    let shared_ratio = ratio.clone();
+    let applying_for_notify = applying.clone();
+    let last_size_for_notify = last_size.clone();
+    paned.connect_position_notify(move |paned| {
+        if applying_for_notify.get() {
+            return;
+        }
+        let size = if paned.orientation() == gtk::Orientation::Horizontal {
+            paned.width()
+        } else {
+            paned.height()
+        };
+        if size <= 0 {
+            return;
+        }
+        if last_size_for_notify.get() != size {
+            // Width changed — this position-notify is an auto-adjust,
+            // not a user drag. Don't update the ratio, and leave
+            // `last_size` for the tick callback to update after it
+            // re-applies the ratio; otherwise consuming the size change
+            // here would suppress the tick's re-apply and drift the split.
+            return;
+        }
+        let new_ratio = layout_state::snapshot_split_ratio(
+            paned.position(),
+            size,
+            Some(*shared_ratio.borrow()),
+        );
+        *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
+    });
+
+    // Re-apply position = ratio * size whenever the paned's actual
+    // size changes (sidebar toggles, window resizes). GtkWidget's
+    // `width`/`height` properties don't reliably emit notify across
+    // GTK 4.x versions, so we poll via a per-frame tick callback
+    // (intentional: O(1) integer comparison per frame; always returns
+    // Continue so the paned stays reactive for its entire lifetime).
+    let shared_ratio_for_resize = ratio.clone();
+    let applying_for_resize = applying.clone();
+    let last_size_for_resize = last_size.clone();
+    let resize_orientation = paned.orientation();
+    paned.add_tick_callback(move |paned, _| {
+        let size = if resize_orientation == gtk::Orientation::Horizontal {
+            paned.width()
+        } else {
+            paned.height()
+        };
+        if size <= 0 {
+            return glib::ControlFlow::Continue;
+        }
+        if last_size_for_resize.get() != size {
+            // Debug-only jitter probe: each line is one ratio re-apply.
+            // Rapid repeated lines on a stable layout signal the size is
+            // oscillating (worth watching as split trees get deep). Costs
+            // nothing in release builds.
+            #[cfg(debug_assertions)]
+            {
+                let previous = last_size_for_resize.get();
+                eprintln!(
+                    "limux: split-ratio tick reapply ({resize_orientation:?}) size {previous} -> {size}"
+                );
+            }
+            last_size_for_resize.set(size);
+            let ratio = *shared_ratio_for_resize.borrow();
+            crate::window::apply_ratio_value(
+                paned,
+                resize_orientation,
+                ratio,
+                &applying_for_resize,
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+
+    apply_split_ratio_after_layout(paned, paned.orientation(), ratio.clone(), applying);
 }
 
 fn pane_has_room_to_split(target: &gtk::Widget, orientation: gtk::Orientation) -> bool {
@@ -552,6 +655,7 @@ pub(crate) fn build_split_node_from_layout(
     shortcuts: &Rc<crate::shortcut_config::ResolvedShortcutConfig>,
     ws_id: &str,
     working_directory: Option<&str>,
+    autostart_command: &Rc<RefCell<Option<String>>>,
     layout: &LayoutNodeState,
 ) -> SplitNode {
     match layout {
@@ -561,8 +665,12 @@ pub(crate) fn build_split_node_from_layout(
                 shortcuts,
                 ws_id,
                 working_directory,
-                Some(pane_state),
-                false,
+                autostart_command.clone(),
+                crate::window::PaneCreationOptions {
+                    initial_state: Some(pane_state),
+                    skip_default_tab: false,
+                    suppress_initial_autostart: false,
+                },
             );
             SplitNode::Leaf {
                 pane_widget: pane.upcast(),
@@ -583,6 +691,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.start,
                 )),
                 right: Box::new(build_split_node_from_layout(
@@ -590,6 +699,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.end,
                 )),
             }
@@ -600,6 +710,22 @@ pub(crate) fn build_split_node_from_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn split_ratio_callbacks_release_unmapped_paned() {
+        gtk::init().expect("initialize GTK");
+        for orientation in [gtk::Orientation::Horizontal, gtk::Orientation::Vertical] {
+            let paned = gtk::Paned::new(orientation);
+            let weak = paned.downgrade();
+            install_split_ratio_tracking(&paned, &Rc::new(RefCell::new(0.5)));
+            drop(paned);
+            assert!(
+                weak.upgrade().is_none(),
+                "callbacks retained the split widget"
+            );
+        }
+    }
 
     #[test]
     fn split_extent_requires_room_for_both_children() {

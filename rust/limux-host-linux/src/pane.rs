@@ -5,6 +5,10 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -15,14 +19,14 @@ use gtk4 as gtk;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
 
-use crate::app_config::AppConfig;
+use crate::app_config::{AppConfig, LinkOpenDestination};
 use crate::keybind_editor;
 use crate::layout_state::{
     PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
 };
-use crate::settings_editor;
+use crate::link_uri;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
-use crate::terminal::{self, TerminalCallbacks};
+use crate::terminal::{self, LinkOpenRequest, TerminalCallbacks};
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -105,6 +109,7 @@ enum ContentDropZone {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneEmptyReason {
+    ClosedLastTerminal,
     ClosedLastTab,
     MovedLastTabOut,
 }
@@ -170,8 +175,31 @@ fn lookup_pane_internals(id: u32) -> Option<Rc<PaneInternals>> {
     PANE_REGISTRY.with(|registry| registry.borrow().get(&id)?.upgrade())
 }
 
+/// Global lookup for GUI operations such as moving panes between workspaces.
+/// Workspace-scoped control commands must use [`pane_widget_for_root`].
 pub fn find_pane_widget_by_id(pane_id: u32) -> Option<gtk::Widget> {
     lookup_pane_internals(pane_id).map(|internals| internals.pane_outer.clone().upcast())
+}
+
+pub fn retire_pane(pane_widget: &gtk::Widget) {
+    let Some(outer) = pane_widget.downcast_ref::<gtk::Box>() else {
+        return;
+    };
+    let internals = unsafe { outer.steal_data::<Rc<PaneInternals>>("limux-pane-internals") };
+    if let Some(internals) = internals {
+        let entries = {
+            let mut tab_state = internals.tab_state.borrow_mut();
+            tab_state.active_tab = None;
+            tab_state.active_rename_tab = None;
+            std::mem::take(&mut tab_state.tabs)
+        };
+        for entry in entries {
+            entry.prepare_for_removal();
+            internals.tab_strip.remove(&entry.tab_button);
+            internals.content_stack.remove(&entry.content);
+        }
+        unregister_pane(internals.pane_id);
+    }
 }
 
 pub fn set_workspace_dragging_all(active: bool) {
@@ -196,32 +224,38 @@ type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
 type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
+type PaneOpenUrlInBrowserCallback = dyn Fn(&gtk::Widget, &str);
+type PaneVisibilityCallback = dyn Fn(&gtk::Widget) -> bool;
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
 type PaneShortcutCaptureCallback =
     dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>;
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 type PaneConfigCallback = dyn Fn() -> Rc<RefCell<AppConfig>>;
-type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
 /// Returns the workspace id that owns a given pane widget, or `None` if the
 /// pane is not yet attached to a workspace. Used to stamp `LIMUX_WORKSPACE_ID`
 /// onto every terminal spawned inside the pane.
 type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
 
 pub struct PaneCallbacks {
+    pub workspace_id: String,
+    pub autostart_command: Rc<RefCell<Option<String>>>,
+    pub suppress_next_autostart: Cell<bool>,
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
     pub on_desktop_notification: Box<PaneDesktopNotificationCallback>,
     pub on_open_browser_here: Box<PaneOpenBrowserHereCallback>,
+    pub on_open_url_in_browser: Box<PaneOpenUrlInBrowserCallback>,
     pub on_open_keybinds: Box<PaneWidgetCallback>,
     pub current_shortcuts: Box<PaneShortcutStateCallback>,
     pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneEmptyCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
+    pub on_unread_changed: Box<PaneSignalCallback>,
+    pub is_pane_visible: Box<PaneVisibilityCallback>,
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
-    pub on_config_changed: Rc<PaneConfigChangedCallback>,
     /// Resolve the workspace id for a given pane widget. May be `None` while
     /// the pane is still being constructed; callers treat that as "unknown".
     pub workspace_for_pane: Box<PaneWorkspaceLookupCallback>,
@@ -331,24 +365,25 @@ pub const PANE_CSS: &str = r#"
 .limux-tab-close {
     background: none;
     border: none;
-    border-radius: 3px;
-    padding: 1px;
+    border-radius: 6px;
+    padding: 2px;
     min-height: 0;
     min-width: 0;
+    margin: 0 0 0 4px;
     color: alpha(@window_fg_color, 0.28);
-    margin-left: 4px;
 }
 .limux-tab-close:hover {
     color: alpha(@window_fg_color, 0.8);
-    background: alpha(@window_fg_color, 0.1);
+    background: alpha(@window_fg_color, 0.08);
 }
 .limux-pane-action {
     background: none;
     border: none;
-    border-radius: 4px;
-    padding: 4px 5px;
+    border-radius: 6px;
+    padding: 4px;
     min-height: 0;
     min-width: 0;
+    margin: 0 1px;
     color: alpha(@window_fg_color, 0.4);
 }
 .limux-pane-action:hover {
@@ -385,6 +420,11 @@ pub const PANE_CSS: &str = r#"
     background: alpha(@window_fg_color, 0.08);
 }
 .limux-pin-icon {
+    font-size: 9px;
+    margin-right: 2px;
+}
+.limux-tab-unread-dot {
+    color: @accent_bg_color;
     font-size: 9px;
     margin-right: 2px;
 }
@@ -442,23 +482,44 @@ pub fn create_pane(
         .build();
     outer.set_size_request(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
 
-    // The single header line: tabs (left) + action icons (right)
+    // The single header line: [leading slot] tabs (left) + action icons (right)
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .build();
     header.add_css_class("limux-pane-header");
 
+    // Empty leading slot at the very start of the header — window.rs can
+    // stash the dock toggle here when the top bar is hidden and the sidebar
+    // is collapsed. Hidden by default (no children = no width).
+    let leading_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    leading_box.add_css_class("limux-pane-leading");
+    header.append(&leading_box);
+
     let tab_overlay = gtk::Overlay::new();
     tab_overlay.add_css_class("limux-tab-overlay");
     tab_overlay.set_hexpand(true);
 
+    // tab_strip holds the actual tab buttons (natural width). A WindowHandle
+    // sibling to its right soaks up the remaining space and drags the window
+    // when clicked, so the empty area after the last tab is also draggable.
     let tab_strip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    let tab_drag_filler = gtk::WindowHandle::new();
+    tab_drag_filler.set_hexpand(true);
+    let tab_strip_wrapper = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .hexpand(true)
         .build();
-    tab_overlay.set_child(Some(&tab_strip));
+    tab_strip_wrapper.append(&tab_strip);
+    tab_strip_wrapper.append(&tab_drag_filler);
+    tab_overlay.set_child(Some(&tab_strip_wrapper));
 
     let drop_indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
     drop_indicator.add_css_class("limux-tab-drop-indicator");
@@ -511,7 +572,6 @@ pub fn create_pane(
         "limux-split-vertical-symbolic",
         &pane_action_tooltip(&shortcuts, "Split down", Some(ShortcutId::SplitDown)),
     );
-    let settings_btn = icon_button("emblem-system-symbolic", "Settings");
     let close_btn = icon_button(
         "window-close-symbolic",
         &pane_action_tooltip(&shortcuts, "Close pane", Some(ShortcutId::CloseFocusedPane)),
@@ -521,7 +581,6 @@ pub fn create_pane(
     actions.append(&new_browser_btn);
     actions.append(&split_h_btn);
     actions.append(&split_v_btn);
-    actions.append(&settings_btn);
     actions.append(&close_btn);
 
     header.append(&tab_overlay);
@@ -548,6 +607,7 @@ pub fn create_pane(
         drop_indicator: drop_indicator.clone(),
         content_drop_overlay: content_drop_overlay.clone(),
         pane_outer: outer.clone(),
+        leading_box: leading_box.clone(),
         callbacks: callbacks.clone(),
         working_directory: ws_wd.clone(),
         workspace_dragging: workspace_dragging.clone(),
@@ -564,11 +624,11 @@ pub fn create_pane(
     }
 
     {
-        let internals = internals.clone();
-        let wd = ws_wd.clone();
+        let pane_widget = outer.downgrade();
         new_term_btn.connect_clicked(move |_| {
-            let dir = wd.borrow().clone();
-            add_terminal_tab_inner(&internals, dir.as_deref(), None);
+            if let Some(pane_widget) = pane_widget.upgrade() {
+                add_terminal_tab_to_pane(&pane_widget.upcast());
+            }
         });
     }
     {
@@ -598,21 +658,6 @@ pub fn create_pane(
             (cb.on_close_pane)(&pw.clone().upcast());
         });
     }
-    {
-        let internals = internals.clone();
-        settings_btn.connect_clicked(move |_| {
-            settings_editor::present_settings_dialog(
-                &internals.pane_outer,
-                settings_editor::SettingsEditorInput {
-                    config: (internals.callbacks.current_config)(),
-                    shortcuts: (internals.callbacks.current_shortcuts)(),
-                    on_capture: internals.callbacks.on_capture_shortcut.clone(),
-                    on_config_changed: internals.callbacks.on_config_changed.clone(),
-                },
-            );
-        });
-    }
-
     install_tab_strip_drop_target(&tab_overlay, &internals);
     install_content_drop_target(&internals);
 
@@ -663,6 +708,12 @@ pub fn cycle_tab_in_pane(pane_widget: &gtk::Widget, delta: i32) {
         &internals.tab_state,
         &new_id,
     );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        &new_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
+    );
     (internals.callbacks.on_state_changed)();
 }
 
@@ -688,6 +739,12 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
         &internals.content_stack,
         &internals.tab_state,
         &tab_id,
+    );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        &tab_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
     );
     true
 }
@@ -762,7 +819,78 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
         &internals.tab_state,
         tab_id,
     );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        tab_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
+    );
     true
+}
+
+/// Set a custom title, or clear it when the title is empty.
+pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        entry.custom_name = None;
+        entry.title_label.set_text(entry.kind.default_title());
+    } else {
+        entry.custom_name = Some(trimmed.to_string());
+        entry.title_label.set_text(trimmed);
+    }
+    true
+}
+
+/// Pin or unpin a tab. Pinned tabs refuse to close (see `close_tab_in_pane`).
+pub fn set_tab_pinned_in_pane(pane_widget: &gtk::Widget, tab_id: &str, pinned: bool) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    entry.pinned = pinned;
+    apply_pin_visuals(&entry.tab_button, pinned);
+    true
+}
+
+fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    if entry.unread == unread {
+        return false;
+    }
+    entry.unread = unread;
+    entry.unread_dot.set_visible(unread);
+    true
+}
+
+fn clear_tab_unread(tab_state: &Rc<RefCell<TabState>>, tab_id: &str) -> bool {
+    tab_state
+        .borrow_mut()
+        .find_tab_mut(tab_id)
+        .is_some_and(|entry| set_tab_unread(entry, false))
+}
+
+fn clear_tab_unread_if_visible(
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    pane_widget: &gtk::Widget,
+    callbacks: &Rc<PaneCallbacks>,
+) {
+    if (callbacks.is_pane_visible)(pane_widget) && clear_tab_unread(tab_state, tab_id) {
+        (callbacks.on_unread_changed)();
+    }
 }
 
 fn normalize_surface_hint(raw: &str) -> &str {
@@ -780,62 +908,59 @@ fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> b
     !requested.is_empty() && (requested == tab_id || requested == surface_id)
 }
 
+fn select_terminal_tab<'a>(
+    pane_id: u32,
+    terminal_tab_ids: impl IntoIterator<Item = &'a str>,
+    active_tab: Option<&str>,
+    surface_hint: Option<&str>,
+) -> Option<&'a str> {
+    let mut fallback = None;
+    for tab_id in terminal_tab_ids {
+        if let Some(surface_hint) = surface_hint {
+            if surface_hint_matches(&composite_surface_id(pane_id, tab_id), tab_id, surface_hint) {
+                return Some(tab_id);
+            }
+            // An explicit target must not fall back to the active tab.
+            continue;
+        }
+        if active_tab == Some(tab_id) {
+            return Some(tab_id);
+        }
+        fallback.get_or_insert(tab_id);
+    }
+    fallback
+}
+
 pub fn terminal_handle_for_surface(
     pane_widget: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
     let internals = find_pane_internals(pane_widget)?;
-    let pane_id = internals.pane_id;
     let tab_state = internals.tab_state.borrow();
-    let requested = surface_hint
-        .map(normalize_surface_hint)
-        .filter(|value| !value.is_empty());
-    let active_tab = tab_state.active_tab.as_deref();
-    let mut fallback = None;
-
-    for entry in &tab_state.tabs {
-        let TabKind::Terminal { state } = &entry.kind else {
-            continue;
-        };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-
-        if requested.is_some_and(|value| value == entry.id || value == full_surface_id) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if active_tab == Some(entry.id.as_str()) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if fallback.is_none() {
-            fallback = Some((full_surface_id, state.handle.clone()));
-        }
-    }
-
-    fallback
+    let terminal_tab_ids = tab_state.tabs.iter().filter_map(|entry| {
+        matches!(entry.kind, TabKind::Terminal { .. }).then_some(entry.id.as_str())
+    });
+    let tab_id = select_terminal_tab(
+        internals.pane_id,
+        terminal_tab_ids,
+        tab_state.active_tab.as_deref(),
+        surface_hint,
+    )?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let TabKind::Terminal { state } = &entry.kind else {
+        return None;
+    };
+    Some((
+        composite_surface_id(internals.pane_id, tab_id),
+        state.handle.clone(),
+    ))
 }
 
 pub fn exact_terminal_handle_for_surface(
     pane_widget: &gtk::Widget,
     surface_hint: &str,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let internals = find_pane_internals(pane_widget)?;
-    let pane_id = internals.pane_id;
-    let tab_state = internals.tab_state.borrow();
-
-    for entry in &tab_state.tabs {
-        let TabKind::Terminal { state } = &entry.kind else {
-            continue;
-        };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-        if surface_hint_matches(&full_surface_id, &entry.id, surface_hint) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-    }
-
-    None
+    terminal_handle_for_surface(pane_widget, Some(surface_hint))
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +972,17 @@ enum TabKind {
     Terminal { state: TerminalTabState },
     Browser { state: BrowserTabState },
     Keybinds,
+}
+
+impl TabKind {
+    /// The label a tab of this kind carries before anything overrides it.
+    fn default_title(&self) -> &'static str {
+        match self {
+            Self::Terminal { .. } => "Terminal",
+            Self::Browser { .. } => "Browser",
+            Self::Keybinds => "Keybinds",
+        }
+    }
 }
 
 enum TabFocusTarget {
@@ -887,16 +1023,20 @@ struct TabEntry {
     id: String,
     tab_button: gtk::Box,
     title_label: gtk::Label,
+    unread_dot: gtk::Label,
     content: gtk::Widget,
     custom_name: Option<String>,
     pinned: bool,
+    unread: bool,
     kind: TabKind,
 }
 
 impl TabEntry {
     fn prepare_for_removal(&self) {
-        if let TabKind::Browser { state } = &self.kind {
-            state.handles.prepare_for_removal();
+        match &self.kind {
+            TabKind::Terminal { state } => state.handle.shutdown(),
+            TabKind::Browser { state } => state.handles.prepare_for_removal(),
+            TabKind::Keybinds => {}
         }
     }
 }
@@ -916,6 +1056,7 @@ pub struct PaneInternals {
     drop_indicator: gtk::Box,
     content_drop_overlay: gtk::Box,
     pane_outer: gtk::Box,
+    leading_box: gtk::Box,
     callbacks: Rc<PaneCallbacks>,
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
     workspace_dragging: Rc<Cell<bool>>,
@@ -944,6 +1085,7 @@ fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
         .icon_name(icon_name)
         .tooltip_text(tooltip)
         .has_frame(false)
+        .valign(gtk::Align::Center)
         .build();
     btn.add_css_class("limux-pane-action");
     btn
@@ -1114,6 +1256,7 @@ fn make_terminal_callbacks(
     let callbacks_for_pwd = internals.callbacks.clone();
     let callbacks_for_close = internals.callbacks.clone();
     let callbacks_for_browser_here = internals.callbacks.clone();
+    let callbacks_for_open_url = internals.callbacks.clone();
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
@@ -1137,11 +1280,7 @@ fn make_terminal_callbacks(
             if has_custom || title.is_empty() {
                 return;
             }
-            let display = if title.len() > 22 {
-                format!("{}…", &title[..21])
-            } else {
-                title.to_string()
-            };
+            let display = display_terminal_title(title);
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
@@ -1183,14 +1322,23 @@ fn make_terminal_callbacks(
         }),
         on_open_url: Box::new({
             let pane_outer = internals.pane_outer.clone();
-            move |url, external| {
-                if external {
-                    open_url_in_external_browser(url);
+            move |url, request| {
+                let configured_destination = (callbacks_for_open_url.current_config)()
+                    .borrow()
+                    .links
+                    .open_destination;
+                let Some(destination) =
+                    resolved_link_destination(configured_destination, request, url)
+                else {
+                    eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
                     return;
-                }
-
+                };
                 let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                add_browser_tab_to_pane_with_uri(&pane_widget, Some(url));
+                if destination == LinkOpenDestination::BrowserTab {
+                    (callbacks_for_open_url.on_open_url_in_browser)(&pane_widget, url);
+                } else {
+                    open_url_in_external_browser(url);
+                }
             }
         }),
         on_open_browser_here: Box::new({
@@ -1235,39 +1383,39 @@ fn make_terminal_callbacks(
     }
 }
 
-fn is_safe_browser_url(url: &str) -> bool {
-    // Minimal allow-list of URI schemes that may be handed to the system
-    // browser on Ctrl+click. The threat model is hostile terminal output:
-    // anything that ends up in a pane's scrollback can craft an OSC 8
-    // hyperlink, and clicking it must not lead to code execution.
-    //
-    // Why only http/https/mailto?
-    // - `javascript:`, `vbscript:`, `data:` are classic XSS sinks (Gitea
-    //   blocks these unconditionally — github.com/go-gitea/gitea#25960).
-    // - `file://` directly opens local files via the registered handler;
-    //   a hostile `cat` of a crafted .desktop file would be RCE.
-    // - `ftp://`, `ftps://`, `smb://`, `nfs://`, `dav://`, `sftp://` all
-    //   auto-mount via gvfs and can execute binaries on the mounted share
-    //   (positive.security/blog/url-open-rce).
-    // - Custom schemes (`vscode://`, `slack://`, `obsidian://`, ...) have
-    //   historically had RCE CVEs in their handlers; we don't second-guess
-    //   that surface area here.
-    //
-    // RFC 3986 §3.1: scheme matching is case-insensitive.
-    let Some(colon) = url.find(':') else {
-        return false;
+fn display_terminal_title(title: &str) -> String {
+    let mut indices = title.char_indices();
+    let Some((truncate_at, _)) = indices.nth(21) else {
+        return title.to_string();
     };
-    let scheme = url[..colon].to_ascii_lowercase();
-    let rest = &url[colon..];
-    match scheme.as_str() {
-        "https" | "http" => rest.starts_with("://"),
-        "mailto" => rest.starts_with(':'),
-        _ => false,
+    if indices.next().is_none() {
+        return title.to_string();
     }
+    format!("{}…", &title[..truncate_at])
+}
+
+fn resolved_link_destination(
+    configured: LinkOpenDestination,
+    request: LinkOpenRequest,
+    url: &str,
+) -> Option<LinkOpenDestination> {
+    if !link_uri::is_safe_external_url(url) {
+        return None;
+    }
+
+    let destination = match request {
+        LinkOpenRequest::Configured => configured,
+        LinkOpenRequest::Destination(destination) => destination,
+    }
+    .effective(cfg!(feature = "webkit"));
+    if destination == LinkOpenDestination::BrowserTab && !link_uri::is_embedded_browser_url(url) {
+        return Some(LinkOpenDestination::DefaultBrowser);
+    }
+    Some(destination)
 }
 
 fn open_url_in_external_browser(url: &str) {
-    if !is_safe_browser_url(url) {
+    if !link_uri::is_safe_external_url(url) {
         eprintln!("limux: refusing to open URL with unrecognized scheme: {url}");
         return;
     }
@@ -1318,7 +1466,7 @@ fn add_terminal_tab_inner(
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(next_tab_id);
-    let (tab_btn, title_label) = build_tab_button("Terminal", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
         options
@@ -1367,15 +1515,36 @@ fn add_terminal_tab_inner(
     {
         extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
     }
-    let startup_command = options
+    let restored_agent_command = options
         .as_ref()
         .and_then(|value| value.agent.as_ref())
         .and_then(|agent| agent.resume_command());
-    if let Some(command) = startup_command.as_deref() {
+    if let Some(command) = restored_agent_command.as_deref() {
         eprintln!(
             "limux: restoring agent terminal surface={}:{} command={}",
             internals.pane_id, tab_id, command
         );
+    }
+    let suppress_autostart = internals.callbacks.suppress_next_autostart.replace(false);
+    let (startup_command, workspace_autostart_command) = select_terminal_commands(
+        restored_agent_command,
+        internals.callbacks.autostart_command.borrow().clone(),
+        suppress_autostart,
+    );
+    let mut initial_input = None;
+    if let Some(command) = workspace_autostart_command.as_deref() {
+        if terminal::terminal_command_accepts_shell_input() {
+            eprintln!(
+                "limux: running workspace autostart workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+            initial_input = prepare_workspace_autostart(command);
+        } else {
+            eprintln!(
+                "limux: skipping workspace autostart for non-shell terminal command workspace={} surface={}:{}",
+                internals.callbacks.workspace_id, internals.pane_id, tab_id
+            );
+        }
     }
 
     let term = terminal::create_terminal(
@@ -1385,6 +1554,7 @@ fn add_terminal_tab_inner(
             copy_selection_to_clipboard,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
+            initial_input,
             extra_env,
         },
         term_callbacks,
@@ -1398,11 +1568,13 @@ fn add_terminal_tab_inner(
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            unread: false,
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
@@ -1449,6 +1621,105 @@ fn add_terminal_tab_inner(
     }
 }
 
+fn select_terminal_commands(
+    restored_agent_command: Option<String>,
+    autostart_command: Option<String>,
+    suppress_autostart: bool,
+) -> (Option<String>, Option<String>) {
+    if restored_agent_command.is_some() {
+        return (restored_agent_command, None);
+    }
+    if suppress_autostart {
+        return (None, None);
+    }
+    (None, autostart_command)
+}
+
+fn prepare_workspace_autostart(command: &str) -> Option<String> {
+    if command.contains('\0') {
+        eprintln!("limux: workspace autostart contains a NUL byte; refusing to run it");
+        return None;
+    }
+
+    let script_path = create_workspace_autostart_script(command)?;
+    workspace_autostart_initial_input(&script_path)
+}
+
+fn create_workspace_autostart_script(command: &str) -> Option<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if runtime_dir.is_empty() {
+        eprintln!("limux: XDG_RUNTIME_DIR is unset; workspace autostart was not started");
+        return None;
+    }
+
+    let dir = PathBuf::from(runtime_dir).join("limux");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("limux: failed to create autostart runtime directory: {error}");
+        return None;
+    }
+
+    for suffix in 0..100_u8 {
+        let path = dir.join(format!(
+            "workspace-autostart-{}-{suffix}.sh",
+            std::process::id()
+        ));
+        let Some(script) = workspace_autostart_script(command, &path) else {
+            eprintln!("limux: workspace autostart path is not valid UTF-8");
+            return None;
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path);
+        match file {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(script.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("limux: failed to write workspace autostart script: {error}");
+                    return None;
+                }
+                return Some(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                eprintln!("limux: failed to create workspace autostart script: {error}");
+                return None;
+            }
+        }
+    }
+
+    eprintln!("limux: failed to allocate a unique workspace autostart script path");
+    None
+}
+
+fn workspace_autostart_script(command: &str, script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    Some(format!(
+        "#!/bin/sh\nrm -f -- {}\n{command}\n",
+        shell_quote(script_path)
+    ))
+}
+
+fn workspace_autostart_initial_input(script_path: &Path) -> Option<String> {
+    let script_path = script_path.to_str()?;
+    // Only the private script path enters terminal input. The configured
+    // autostart text stays out of shell history and scrollback, while Ghostty's
+    // configured interactive shell remains untouched.
+    Some(format!(". {}\n", shell_quote(script_path)))
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
     let tab_id = options
         .as_ref()
@@ -1465,7 +1736,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
         internals.callbacks.clone(),
     );
 
-    let (tab_btn, title_label) = build_tab_button(&title, &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button(&title, &tab_id, internals);
 
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
@@ -1475,11 +1746,13 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            unread: false,
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
@@ -1532,7 +1805,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(next_tab_id);
 
-    let (tab_btn, title_label) = build_tab_button("Keybinds", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button("Keybinds", &tab_id, internals);
 
     let widget = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     internals.content_stack.add_named(&widget, Some(&tab_id));
@@ -1543,6 +1816,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: input
                 .options
@@ -1553,6 +1827,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
                 .as_ref()
                 .map(|value| value.pinned)
                 .unwrap_or(false),
+            unread: false,
             kind: TabKind::Keybinds,
         });
     }
@@ -1602,8 +1877,15 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        let dir = internals.working_directory.borrow().clone();
+        let dir = active_tab_working_directory(pane_widget)
+            .or_else(|| internals.working_directory.borrow().clone());
         add_terminal_tab_inner(&internals, dir.as_deref(), None);
+    }
+}
+
+pub fn add_terminal_tab_to_pane_in_directory(pane_widget: &gtk::Widget, directory: Option<&str>) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        add_terminal_tab_inner(&internals, directory, None);
     }
 }
 
@@ -1622,6 +1904,9 @@ pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&
             uri: Some(uri),
         });
         add_browser_tab_inner(&internals, options);
+        if uri.is_some() {
+            (internals.callbacks.on_state_changed)();
+        }
     }
 }
 
@@ -1736,6 +2021,13 @@ fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
     }
 }
 
+/// Returns the leading slot (at the very start of the pane header) so the
+/// outer app can place widgets there (e.g. a dock toggle). The box stays
+/// empty by default.
+pub fn pane_leading_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
+    find_pane_internals(pane_widget).map(|internals| internals.leading_box.clone())
+}
+
 pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return false;
@@ -1745,6 +2037,15 @@ pub fn is_pane_widget(widget: &gtk::Widget) -> bool {
     while let Some(current) = child {
         if current.has_css_class("limux-pane-header") {
             return true;
+        }
+        // The header can be wrapped in a WindowHandle (used so empty space in
+        // the header drags the window); look through it for the real header.
+        if let Some(handle) = current.downcast_ref::<gtk::WindowHandle>() {
+            if let Some(inner) = handle.child() {
+                if inner.has_css_class("limux-pane-header") {
+                    return true;
+                }
+            }
         }
         child = current.next_sibling();
     }
@@ -1767,6 +2068,11 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
         TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
+}
+
+pub fn active_tab_working_directory(pane_widget: &gtk::Widget) -> Option<String> {
+    let tab_id = active_tab_in_pane(pane_widget)?;
+    tab_working_directory(pane_widget, &tab_id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1800,6 +2106,98 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
+fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
+    let mut panes = PANE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|internals| internals.callbacks.workspace_id == workspace_id)
+            .collect::<Vec<_>>()
+    });
+    panes.sort_by_key(|internals| internals.pane_id);
+    panes
+}
+
+pub enum TabTargetResolution {
+    NotFound,
+    Unique(u32, String),
+    Ambiguous,
+}
+
+pub fn tab_target_for_workspace(workspace_id: &str, surface_hint: &str) -> TabTargetResolution {
+    let mut target = None;
+    for internals in pane_internals_for_workspace(workspace_id) {
+        let pane_id = internals.pane_id;
+        let tab_state = internals.tab_state.borrow();
+        for entry in &tab_state.tabs {
+            let surface_id = composite_surface_id(pane_id, &entry.id);
+            if surface_hint_matches(&surface_id, &entry.id, surface_hint) {
+                if target.is_some() {
+                    return TabTargetResolution::Ambiguous;
+                }
+                target = Some((pane_id, entry.id.clone()));
+            }
+        }
+    }
+    match target {
+        Some((pane_id, tab_id)) => TabTargetResolution::Unique(pane_id, tab_id),
+        None => TabTargetResolution::NotFound,
+    }
+}
+
+pub fn mark_tab_unread_in_workspace(
+    workspace_id: &str,
+    pane_id: u32,
+    tab_id: &str,
+) -> Option<bool> {
+    let internals = pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)?;
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let entry = tab_state.find_tab_mut(tab_id)?;
+    Some(set_tab_unread(entry, true))
+}
+
+pub fn tab_is_visible_in_workspace(
+    workspace_id: &str,
+    root: &gtk::Widget,
+    pane_id: u32,
+    tab_id: &str,
+) -> bool {
+    pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)
+        .is_some_and(|internals| {
+            internals.pane_outer.is_ancestor(root)
+                && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
+        })
+}
+
+pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals.tab_state.borrow().active_tab.clone();
+        if let Some(tab_id) = active_tab {
+            changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
+    pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .any(|internals| {
+            internals
+                .tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|entry| entry.unread)
+        })
+}
+
 pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
     pane_internals_for_root(root)
         .into_iter()
@@ -1831,6 +2229,13 @@ pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<g
         .into_iter()
         .find(|internals| internals.pane_id == pane_id)
         .map(|internals| internals.pane_outer.clone().upcast())
+}
+
+/// Includes panes temporarily detached from the visible tree by zoom.
+pub(crate) fn pane_widget_for_workspace(workspace_id: &str, pane_id: u32) -> Option<gtk::Widget> {
+    let internals = lookup_pane_internals(pane_id)?;
+    (internals.callbacks.workspace_id == workspace_id)
+        .then(|| internals.pane_outer.clone().upcast())
 }
 
 pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
@@ -1908,23 +2313,13 @@ pub fn terminal_handle_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
 ) -> Option<(String, terminal::TerminalHandle)> {
-    let requested = surface_hint
-        .map(normalize_surface_hint)
-        .filter(|value| !value.is_empty());
+    let requested = surface_hint.map(normalize_surface_hint);
 
     if let Some(requested) = requested {
         for internals in pane_internals_for_root(root) {
             let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-            if let Some((surface_id, handle)) =
-                terminal_handle_for_surface(&pane_widget, Some(requested))
-            {
-                if surface_id == requested
-                    || surface_id
-                        .strip_prefix("surface:")
-                        .is_some_and(|value| value == requested)
-                {
-                    return Some((surface_id, handle));
-                }
+            if let Some(target) = exact_terminal_handle_for_surface(&pane_widget, requested) {
+                return Some(target);
             }
         }
         return None;
@@ -2024,17 +2419,17 @@ fn build_tab_button(
     title: &str,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
-) -> (gtk::Box, gtk::Label) {
+) -> (gtk::Box, gtk::Label, gtk::Label) {
     let label = new_tab_title_label(title);
-    let tab_button = build_tab_button_from_label(&label, tab_id, internals);
-    (tab_button, label)
+    let (tab_button, unread_dot) = build_tab_button_from_label(&label, tab_id, internals);
+    (tab_button, label, unread_dot)
 }
 
 fn build_tab_button_from_label(
     label: &gtk::Label,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
-) -> gtk::Box {
+) -> (gtk::Box, gtk::Label) {
     if let Some(parent) = label
         .parent()
         .and_then(|parent| parent.downcast::<gtk::Box>().ok())
@@ -2047,15 +2442,22 @@ fn build_tab_button_from_label(
     pin_icon.set_visible(false);
     pin_icon.set_can_target(false);
 
+    let unread_dot = gtk::Label::new(Some("\u{25CF}"));
+    unread_dot.add_css_class("limux-tab-unread-dot");
+    unread_dot.set_visible(false);
+    unread_dot.set_can_target(false);
+
     let close_btn = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .has_frame(false)
+        .valign(gtk::Align::Center)
         .build();
     close_btn.add_css_class("limux-tab-close");
 
     let inner_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     inner_box.set_can_target(false);
     inner_box.append(&pin_icon);
+    inner_box.append(&unread_dot);
     inner_box.append(label);
 
     let tab_btn = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2071,14 +2473,35 @@ fn build_tab_button_from_label(
         let content_stack = internals.content_stack.clone();
         let tab_state = internals.tab_state.clone();
         let callbacks = internals.callbacks.clone();
+        let pane_widget = internals.pane_outer.downgrade();
         let tab_button = tab_btn.clone();
-        click.connect_pressed(move |gesture, _, _, _| {
+        let label = label.clone();
+        click.connect_pressed(move |gesture, n_press, _, _| {
             if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
             activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
+            if let Some(pane_widget) = pane_widget.upgrade() {
+                clear_tab_unread_if_visible(
+                    &tab_state,
+                    &tab_id,
+                    pane_widget.upcast_ref(),
+                    &callbacks,
+                );
+            }
             (callbacks.on_state_changed)();
+            if n_press == 2 {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let tab_strip = tab_strip.clone();
+                let label = label.clone();
+                let tab_state = tab_state.clone();
+                let tab_id = tab_id.clone();
+                let callbacks = callbacks.clone();
+                glib::idle_add_local_once(move || {
+                    show_rename_dialog(&tab_strip, &label, &tab_state, &tab_id, &callbacks);
+                });
+            }
         });
     }
     tab_btn.add_controller(click);
@@ -2108,6 +2531,19 @@ fn build_tab_button_from_label(
         });
     }
     tab_btn.add_controller(right_click);
+
+    // Middle-click to close the tab.
+    let middle_click = gtk::GestureClick::new();
+    middle_click.set_button(2);
+    {
+        let tab_id = tab_id.to_string();
+        let pane_outer = internals.pane_outer.clone();
+        middle_click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            close_tab_in_pane(pane_outer.upcast_ref(), &tab_id);
+        });
+    }
+    tab_btn.add_controller(middle_click);
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
@@ -2178,7 +2614,7 @@ fn build_tab_button_from_label(
         });
     }
 
-    tab_btn
+    (tab_btn, unread_dot)
 }
 
 fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextMenuContext) {
@@ -2286,7 +2722,9 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.popup();
 }
 
-fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(root: &W) -> Option<gtk::Entry> {
+pub(crate) fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(
+    root: &W,
+) -> Option<gtk::Entry> {
     fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
             if entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS) {
@@ -2652,10 +3090,14 @@ fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
             &state.cwd,
         ));
     }
-    entry.tab_button = build_tab_button_from_label(&entry.title_label, &entry.id, target);
+    let (tab_button, unread_dot) =
+        build_tab_button_from_label(&entry.title_label, &entry.id, target);
+    entry.tab_button = tab_button;
+    entry.unread_dot = unread_dot;
     if entry.pinned {
         apply_pin_visuals(&entry.tab_button, true);
     }
+    entry.unread_dot.set_visible(entry.unread);
 }
 
 fn reorder_tab_to_index(
@@ -2709,6 +3151,7 @@ fn transfer_tab_between_panes(
             next_active_after_tab_removal(&all_ids, source_state.active_tab.as_deref(), source_idx);
         (source_state.tabs.remove(source_idx), next_active)
     };
+    let moved_was_unread = entry.unread;
 
     if let Some(window) = entry
         .content
@@ -2738,6 +3181,10 @@ fn transfer_tab_between_panes(
     }
     rebuild_tab_strip(&target.tab_strip, &target.tab_state);
 
+    if moved_was_unread {
+        (source.callbacks.on_unread_changed)();
+    }
+
     let source_empty = source.tab_state.borrow().tabs.is_empty();
     if source_empty {
         (source.callbacks.on_empty)(
@@ -2751,6 +3198,12 @@ fn transfer_tab_between_panes(
             &source.tab_state,
             &next_active,
         );
+        clear_tab_unread_if_visible(
+            &source.tab_state,
+            &next_active,
+            &source.pane_outer.clone().upcast(),
+            &source.callbacks,
+        );
     }
 
     activate_tab(
@@ -2759,6 +3212,17 @@ fn transfer_tab_between_panes(
         &target.tab_state,
         &moved_tab_id,
     );
+    let target_widget = target.pane_outer.clone().upcast();
+    if (target.callbacks.is_pane_visible)(&target_widget) {
+        clear_tab_unread_if_visible(
+            &target.tab_state,
+            &moved_tab_id,
+            &target_widget,
+            &target.callbacks,
+        );
+    } else if moved_was_unread {
+        (target.callbacks.on_unread_changed)();
+    }
     (target.callbacks.on_state_changed)();
     true
 }
@@ -3014,30 +3478,52 @@ fn remove_tab(
 ) {
     commit_active_tab_rename(tab_state);
 
-    let mut ts = tab_state.borrow_mut();
-    let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else {
-        return;
+    let (entry, removed_was_unread, closed_terminal, new_id, was_active) = {
+        let mut ts = tab_state.borrow_mut();
+        let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else {
+            return;
+        };
+        let entry = ts.tabs.remove(idx);
+        let removed_was_unread = entry.unread;
+        let closed_terminal = matches!(&entry.kind, TabKind::Terminal { .. });
+        let was_active = ts.active_tab.as_deref() == Some(tab_id);
+        let new_id = if ts.tabs.is_empty() {
+            None
+        } else {
+            Some(ts.tabs[idx.min(ts.tabs.len() - 1)].id.clone())
+        };
+        (
+            entry,
+            removed_was_unread,
+            closed_terminal,
+            new_id,
+            was_active,
+        )
     };
-    let entry = ts.tabs.remove(idx);
 
     entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
 
-    if ts.tabs.is_empty() {
-        drop(ts);
+    let Some(new_id) = new_id else {
+        if removed_was_unread {
+            (callbacks.on_unread_changed)();
+        }
+        let empty_reason = if empty_reason == PaneEmptyReason::ClosedLastTab && closed_terminal {
+            PaneEmptyReason::ClosedLastTerminal
+        } else {
+            empty_reason
+        };
         (callbacks.on_empty)(&pane_outer.clone().upcast(), empty_reason);
         return;
-    }
-
-    // Activate neighbor tab
-    let new_idx = idx.min(ts.tabs.len() - 1);
-    let new_id = ts.tabs[new_idx].id.clone();
-    let was_active = ts.active_tab.as_deref() == Some(tab_id);
-    drop(ts);
+    };
 
     if was_active {
         activate_tab(tab_strip, content_stack, tab_state, &new_id);
+        clear_tab_unread_if_visible(tab_state, &new_id, &pane_outer.clone().upcast(), callbacks);
+    }
+    if removed_was_unread {
+        (callbacks.on_unread_changed)();
     }
     (callbacks.on_state_changed)();
 }
@@ -3733,10 +4219,12 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
-        is_localhost_input, is_safe_browser_url, next_active_after_tab_removal,
+        classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
+        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
         normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        surface_hint_matches, ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
         BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
         BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
         TAB_RENAME_ENTRY_CSS_CLASSES,
@@ -3746,6 +4234,97 @@ mod tests {
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+    use crate::{app_config::LinkOpenDestination, terminal::LinkOpenRequest};
+
+    #[test]
+    fn explicit_terminal_target_can_follow_the_active_tab() {
+        for target in ["agent", "4:agent", "surface:4:agent"] {
+            assert_eq!(
+                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                Some("agent"),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_missing_terminal_does_not_fall_back_to_active_tab() {
+        for target in ["missing", "5:agent", "", "   ", "surface:", " surface:   "] {
+            assert_eq!(
+                select_terminal_tab(4, ["shell", "agent"], Some("shell"), Some(target)),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_terminal_target_prefers_active_terminal_then_first_terminal() {
+        assert_eq!(
+            select_terminal_tab(4, ["shell", "agent"], Some("agent"), None),
+            Some("agent"),
+        );
+        assert_eq!(
+            select_terminal_tab(4, ["shell", "agent"], Some("browser"), None),
+            Some("shell"),
+        );
+        assert_eq!(select_terminal_tab(4, [], None, None), None);
+    }
+
+    #[test]
+    fn explicit_terminal_command_can_suppress_workspace_autostart() {
+        assert_eq!(
+            select_terminal_commands(None, Some("ssh user@server".to_string()), true),
+            (None, None)
+        );
+        assert_eq!(
+            select_terminal_commands(None, Some("ssh user@server".to_string()), false),
+            (None, Some("ssh user@server".to_string()))
+        );
+        assert_eq!(
+            select_terminal_commands(
+                Some("codex resume abc".to_string()),
+                Some("ssh user@server".to_string()),
+                true,
+            ),
+            (Some("codex resume abc".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn workspace_autostart_uses_hidden_initial_input() {
+        assert_eq!(
+            workspace_autostart_initial_input(std::path::Path::new(
+                "/run/user/1000/limux/workspace-autostart-42-0.sh"
+            ))
+            .as_deref(),
+            Some(". /run/user/1000/limux/workspace-autostart-42-0.sh\n")
+        );
+        assert_eq!(
+            workspace_autostart_script(
+                "echo ready",
+                std::path::Path::new("/run/user/1000/limux/workspace-autostart-42-0.sh")
+            )
+            .as_deref(),
+            Some(
+                "#!/bin/sh\nrm -f -- /run/user/1000/limux/workspace-autostart-42-0.sh\necho ready\n"
+            )
+        );
+    }
+
+    #[test]
+    fn terminal_title_truncation_preserves_utf8_boundaries() {
+        let short_unicode = "12345678901234567890🚀x";
+        let long_unicode = "12345678901234567890🚀xyz";
+
+        assert_eq!(display_terminal_title(short_unicode), short_unicode);
+        assert_eq!(
+            display_terminal_title(long_unicode),
+            "12345678901234567890🚀…"
+        );
+        assert_eq!(
+            display_terminal_title("12345678901234567890123"),
+            "123456789012345678901…"
+        );
+    }
 
     #[test]
     fn pane_action_tooltip_reflects_remaps_and_unbinds() {
@@ -4031,72 +4610,34 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_browser_url_accepts_navigable_schemes() {
-        // Web + email only — see the rationale on `is_safe_browser_url`.
-        for url in [
-            "https://example.com",
-            "https://example.com/path?x=1&y=2",
-            "http://example.com",
-            "http://localhost:8080/foo",
-            "mailto:user@example.com",
-            "mailto:user@example.com?subject=hi",
-        ] {
-            assert!(is_safe_browser_url(url), "should accept {url}");
-        }
-    }
-
-    #[test]
-    fn is_safe_browser_url_is_scheme_case_insensitive() {
-        // RFC 3986 §3.1: scheme matching is case-insensitive. OSC 8 hyperlinks
-        // sometimes preserve the original case from upstream sources, so we
-        // must not reject syntactically valid uppercase/mixed-case schemes.
-        for url in [
-            "HTTPS://example.com",
-            "Https://example.com",
-            "HTTP://example.com",
-            "MAILTO:user@example.com",
-        ] {
-            assert!(is_safe_browser_url(url), "should accept {url}");
-        }
-    }
-
-    #[test]
-    fn is_safe_browser_url_rejects_unsupported_or_dangerous_schemes() {
-        // Threat model: hostile terminal output can craft any OSC 8 hyperlink.
-        // The schemes below are either classic XSS sinks (`javascript:`,
-        // `data:`, `vbscript:`), gvfs auto-mount + exec vectors
-        // (`smb:`, `nfs:`, `dav:`, `davs:`, `sftp:`, `ftp:`, `ftps:`), local
-        // RCE via the file handler (`file:`), or app-specific URIs whose
-        // handlers have a history of RCE CVEs (`vscode:`, `slack:`, etc.).
-        // Leading whitespace and bare paths are also rejected as malformed.
-        for url in [
-            "javascript:alert(1)",
-            "JavaScript:alert(1)",
-            "data:text/html,<script>alert(1)</script>",
-            "vbscript:msgbox(1)",
-            "file:///etc/passwd",
-            "File:///home/manu/notes.md",
-            "ftp://ftp.example.com/pub/file",
-            "ftps://ftp.example.com/pub/file",
-            "smb://server/share",
-            "nfs://server/export",
-            "dav://server/path",
-            "davs://server/path",
-            "sftp://user@host/path",
-            "ssh://user@host",
-            "magnet:?xt=urn:btih:abc",
-            "chrome://settings",
-            "about:blank",
-            "vscode://file/path",
-            "slack://open?team=T",
-            "  https://example.com",
-            "/etc/passwd",
-            "example.com",
-            "",
-            "https:",
-            "http:/example.com",
-        ] {
-            assert!(!is_safe_browser_url(url), "should reject {url:?}");
-        }
+    fn resolved_link_destination_honors_config_and_keeps_mailto_external() {
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::BrowserTab,
+                LinkOpenRequest::Configured,
+                "https://example.com",
+            ),
+            Some(if cfg!(feature = "webkit") {
+                LinkOpenDestination::BrowserTab
+            } else {
+                LinkOpenDestination::DefaultBrowser
+            })
+        );
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::DefaultBrowser,
+                LinkOpenRequest::Destination(LinkOpenDestination::BrowserTab),
+                "mailto:user@example.com",
+            ),
+            Some(LinkOpenDestination::DefaultBrowser)
+        );
+        assert_eq!(
+            resolved_link_destination(
+                LinkOpenDestination::DefaultBrowser,
+                LinkOpenRequest::Configured,
+                "file:///etc/passwd",
+            ),
+            None
+        );
     }
 }
