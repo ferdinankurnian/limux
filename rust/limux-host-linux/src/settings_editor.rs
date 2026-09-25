@@ -414,6 +414,19 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     indicators_row.set_activatable_widget(Some(&indicators_switch));
     group.add(&indicators_row);
 
+    let sidebar_header_row = adw::ActionRow::builder()
+        .title("Sidebar header")
+        .subtitle("Show window controls in the sidebar when the top bar is off")
+        .build();
+    sidebar_header_row.set_title_lines(1);
+    sidebar_header_row.set_subtitle_lines(2);
+    let sidebar_header_switch = gtk::Switch::new();
+    sidebar_header_switch.set_active(input.config.borrow().interface.show_sidebar_header);
+    sidebar_header_switch.set_valign(gtk::Align::Center);
+    sidebar_header_row.add_suffix(&sidebar_header_switch);
+    sidebar_header_row.set_activatable_widget(Some(&sidebar_header_switch));
+    group.add(&sidebar_header_row);
+
     let controls_row = adw::ActionRow::builder()
         .title("Window controls side")
         .subtitle("Place close, minimize, and maximize on the left or right of the top bar (or of the sidebar header when the top bar is off)")
@@ -623,6 +636,30 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             })
             .interface
             .show_workspace_indicators;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        sidebar_header_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_sidebar_header = switch.is_active();
+            if show_sidebar_header == config.borrow().interface.show_sidebar_header {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_sidebar_header = show_sidebar_header;
+            })
+            .interface
+            .show_sidebar_header;
             if switch.is_active() != effective {
                 syncing.set(true);
                 switch.set_active(effective);

@@ -141,6 +141,9 @@ pub struct InterfaceConfig {
     pub window_controls_side: WindowControlsSide,
     pub show_top_bar: bool,
     pub show_workspace_indicators: bool,
+    /// Window-control row inside the sidebar, used when the top bar is off.
+    /// Turn off for a bare sidebar (controls stay reachable via shortcuts).
+    pub show_sidebar_header: bool,
 }
 
 impl Default for InterfaceConfig {
@@ -149,6 +152,7 @@ impl Default for InterfaceConfig {
             window_controls_side: WindowControlsSide::default(),
             show_top_bar: true,
             show_workspace_indicators: true,
+            show_sidebar_header: true,
         }
     }
 }
@@ -474,6 +478,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let show_sidebar_header = interface_obj
+        .and_then(|interface| interface.get("show_sidebar_header"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
@@ -499,6 +508,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             window_controls_side,
             show_top_bar,
             show_workspace_indicators,
+            show_sidebar_header,
         },
         links: LinkConfig { open_destination },
         font_size,
@@ -569,6 +579,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "window_controls_side": config.interface.window_controls_side.as_str(),
             "show_top_bar": config.interface.show_top_bar,
             "show_workspace_indicators": config.interface.show_workspace_indicators,
+            "show_sidebar_header": config.interface.show_sidebar_header,
         }),
     );
     root.insert(
@@ -728,6 +739,7 @@ mod tests {
                     window_controls_side: side,
                     show_top_bar: false,
                     show_workspace_indicators: false,
+                    show_sidebar_header: false,
                 },
                 links: LinkConfig {
                     open_destination: LinkOpenDestination::BrowserTab,

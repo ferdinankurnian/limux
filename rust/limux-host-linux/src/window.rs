@@ -3274,6 +3274,7 @@ fn handle_config_change(
         || previous.interface.show_top_bar != updated.interface.show_top_bar
         || previous.interface.show_workspace_indicators
             != updated.interface.show_workspace_indicators
+        || previous.interface.show_sidebar_header != updated.interface.show_sidebar_header
     {
         apply_top_bar_mode(state);
     }
@@ -3908,7 +3909,14 @@ pub(crate) fn apply_top_bar_mode(state: &State) {
 /// collapsed-sidebar layout when the leading pane is momentarily missing during
 /// a workspace rebuild; the retry runs with `false` so it can never loop.
 fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
-    let (show_top_bar, controls_side, show_workspace_indicators, sidebar_visible_now, widgets) = {
+    let (
+        show_top_bar,
+        controls_side,
+        show_workspace_indicators,
+        show_sidebar_header,
+        sidebar_visible_now,
+        widgets,
+    ) = {
         let s = state.borrow();
         let config = s.config.borrow();
         let (
@@ -3955,6 +3963,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
             ),
             config.interface.window_controls_side,
             config.interface.show_workspace_indicators,
+            config.interface.show_sidebar_header,
             // Just the widget's visible property — the paned position can be
             // stale during animations or startup; we don't want to misclassify
             // a set_visible(true) sidebar as closed.
@@ -3973,7 +3982,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     widgets.handle.set_visible(show_top_bar);
     widgets
         .sidebar_header_handle
-        .set_visible(!show_top_bar && sidebar_visible_now);
+        .set_visible(!show_top_bar && sidebar_visible_now && show_sidebar_header);
     widgets
         .sidebar_drag_area
         .set_visible(!show_top_bar && !sidebar_visible_now);
@@ -3982,7 +3991,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     // Sidebar animation updates must leave an unchanged toolbar in place.
     let toolbar = if show_top_bar {
         Some(&widgets.content)
-    } else if sidebar_visible_now {
+    } else if sidebar_visible_now && show_sidebar_header {
         Some(&widgets.sidebar_header)
     } else {
         None
@@ -4017,7 +4026,11 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     widgets.handle.set_visible(false);
 
     if sidebar_visible_now {
-        layout_sidebar_header(&widgets, controls_side);
+        if show_sidebar_header {
+            layout_sidebar_header(&widgets, controls_side);
+        }
+        // Otherwise the control buttons stay detached (hidden) and the
+        // sidebar renders bare; shortcuts still toggle everything back.
     } else {
         layout_collapsed_dock(state, &widgets, allow_retry);
     }
