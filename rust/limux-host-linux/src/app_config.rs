@@ -139,6 +139,7 @@ impl UiScale {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
     pub window_controls_side: WindowControlsSide,
+    pub show_window_controls: bool,
     pub show_top_bar: bool,
     pub show_workspace_indicators: bool,
     /// Window-control row inside the sidebar, used when the top bar is off.
@@ -150,6 +151,7 @@ impl Default for InterfaceConfig {
     fn default() -> Self {
         Self {
             window_controls_side: WindowControlsSide::default(),
+            show_window_controls: true,
             show_top_bar: true,
             show_workspace_indicators: true,
             show_sidebar_header: true,
@@ -468,6 +470,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(WindowControlsSide::from_str)
         .unwrap_or_default();
 
+    let show_window_controls = interface_obj
+        .and_then(|interface| interface.get("show_window_controls"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
     let show_top_bar = interface_obj
         .and_then(|interface| interface.get("show_top_bar"))
         .and_then(Value::as_bool)
@@ -506,6 +513,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         interface: InterfaceConfig {
             window_controls_side,
+            show_window_controls,
             show_top_bar,
             show_workspace_indicators,
             show_sidebar_header,
@@ -577,6 +585,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "interface".to_string(),
         json!({
             "window_controls_side": config.interface.window_controls_side.as_str(),
+            "show_window_controls": config.interface.show_window_controls,
             "show_top_bar": config.interface.show_top_bar,
             "show_workspace_indicators": config.interface.show_workspace_indicators,
             "show_sidebar_header": config.interface.show_sidebar_header,
@@ -734,23 +743,26 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("settings.json");
         for side in [WindowControlsSide::Left, WindowControlsSide::Right] {
-            let config = AppConfig {
-                interface: InterfaceConfig {
-                    window_controls_side: side,
-                    show_top_bar: false,
-                    show_workspace_indicators: false,
-                    show_sidebar_header: false,
-                },
-                links: LinkConfig {
-                    open_destination: LinkOpenDestination::BrowserTab,
-                },
-                ..Default::default()
-            };
+            for show_window_controls in [true, false] {
+                let config = AppConfig {
+                    interface: InterfaceConfig {
+                        window_controls_side: side,
+                        show_window_controls,
+                        show_top_bar: false,
+                        show_workspace_indicators: false,
+                        show_sidebar_header: false,
+                    },
+                    links: LinkConfig {
+                        open_destination: LinkOpenDestination::BrowserTab,
+                    },
+                    ..Default::default()
+                };
 
-            save_to_path(&path, &config).expect("save config");
-            let loaded = load_from_path(&path);
-            assert!(loaded.warnings.is_empty());
-            assert_eq!(loaded.config, config);
+                save_to_path(&path, &config).expect("save config");
+                let loaded = load_from_path(&path);
+                assert!(loaded.warnings.is_empty());
+                assert_eq!(loaded.config, config);
+            }
         }
     }
 

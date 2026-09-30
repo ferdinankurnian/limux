@@ -428,11 +428,24 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     group.add(&sidebar_header_row);
 
     let controls_row = adw::ActionRow::builder()
+        .title("Window controls")
+        .subtitle("Show close, minimize, and maximize buttons. Turn off for tiling window managers")
+        .build();
+    controls_row.set_title_lines(1);
+    controls_row.set_subtitle_lines(2);
+    let controls_switch = gtk::Switch::new();
+    controls_switch.set_active(input.config.borrow().interface.show_window_controls);
+    controls_switch.set_valign(gtk::Align::Center);
+    controls_row.add_suffix(&controls_switch);
+    controls_row.set_activatable_widget(Some(&controls_switch));
+    group.add(&controls_row);
+
+    let controls_side_row = adw::ActionRow::builder()
         .title("Window controls side")
         .subtitle("Place close, minimize, and maximize on the left or right of the top bar (or of the sidebar header when the top bar is off)")
         .build();
-    controls_row.set_title_lines(1);
-    controls_row.set_subtitle_lines(3);
+    controls_side_row.set_title_lines(1);
+    controls_side_row.set_subtitle_lines(3);
     let controls_dropdown = gtk::DropDown::from_strings(&["Left", "Right"]);
     let initial_side = input.config.borrow().interface.window_controls_side;
     controls_dropdown.set_selected(match initial_side {
@@ -440,9 +453,9 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
         WindowControlsSide::Right => 1,
     });
     controls_dropdown.set_valign(gtk::Align::Center);
-    controls_row.add_suffix(&controls_dropdown);
-    controls_row.set_activatable_widget(Some(&controls_dropdown));
-    group.add(&controls_row);
+    controls_side_row.add_suffix(&controls_dropdown);
+    controls_side_row.set_activatable_widget(Some(&controls_dropdown));
+    group.add(&controls_side_row);
 
     page.add(&group);
 
@@ -671,6 +684,30 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
         let syncing = Rc::new(Cell::new(false));
+        controls_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_window_controls = switch.is_active();
+            if show_window_controls == config.borrow().interface.show_window_controls {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_window_controls = show_window_controls;
+            })
+            .interface
+            .show_window_controls;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
         controls_dropdown.connect_selected_notify(move |dropdown| {
             if syncing.get() {
                 return;
@@ -823,7 +860,12 @@ mod tests {
                 }
             }),
         });
-        for title in ["Top bar", "Workspace indicators on the top bar"] {
+        for title in [
+            "Top bar",
+            "Workspace indicators on the top bar",
+            "Sidebar header",
+            "Window controls",
+        ] {
             let switch = find_control(&page, title)
                 .expect("settings control")
                 .downcast::<gtk::Switch>()
@@ -838,7 +880,7 @@ mod tests {
         dropdown.set_selected(0);
         assert_eq!(dropdown.selected(), 1);
         assert_eq!(config.borrow().interface, Default::default());
-        assert_eq!(rejected_changes.get(), 3, "rollback must not save again");
+        assert_eq!(rejected_changes.get(), 4, "rollback must not save again");
     }
 
     #[test]

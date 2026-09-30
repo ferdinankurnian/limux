@@ -3271,6 +3271,7 @@ fn handle_config_change(
         apply_legacy_folder_grouping(state, updated.workspace.legacy_folder_grouping);
     }
     if previous.interface.window_controls_side != updated.interface.window_controls_side
+        || previous.interface.show_window_controls != updated.interface.show_window_controls
         || previous.interface.show_top_bar != updated.interface.show_top_bar
         || previous.interface.show_workspace_indicators
             != updated.interface.show_workspace_indicators
@@ -3912,6 +3913,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     let (
         show_top_bar,
         controls_side,
+        show_window_controls,
         show_workspace_indicators,
         show_sidebar_header,
         sidebar_visible_now,
@@ -3962,6 +3964,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
                 gtk::prelude::GtkWindowExt::is_fullscreen(&s.window),
             ),
             config.interface.window_controls_side,
+            config.interface.show_window_controls,
             config.interface.show_workspace_indicators,
             config.interface.show_sidebar_header,
             // Just the widget's visible property — the paned position can be
@@ -3996,7 +3999,9 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     } else {
         None
     };
-    if toolbar.is_some_and(|toolbar| toolbar_layout_matches(toolbar, &widgets, controls_side)) {
+    if toolbar.is_some_and(|toolbar| {
+        toolbar_layout_matches(toolbar, &widgets, controls_side, show_window_controls)
+    }) {
         return;
     }
 
@@ -4018,7 +4023,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
     }
 
     if show_top_bar {
-        layout_top_bar_visible(&widgets, controls_side);
+        layout_top_bar_visible(&widgets, controls_side, show_window_controls);
         return;
     }
 
@@ -4027,7 +4032,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
 
     if sidebar_visible_now {
         if show_sidebar_header {
-            layout_sidebar_header(&widgets, controls_side);
+            layout_sidebar_header(&widgets, controls_side, show_window_controls);
         }
         // Otherwise the control buttons stay detached (hidden) and the
         // sidebar renders bare; shortcuts still toggle everything back.
@@ -4040,44 +4045,73 @@ fn toolbar_layout_matches(
     toolbar: &gtk::Box,
     widgets: &TopBarWidgets,
     controls_side: app_config::WindowControlsSide,
+    show_window_controls: bool,
 ) -> bool {
-    let first: &gtk::Widget = match controls_side {
-        app_config::WindowControlsSide::Left => widgets.close.upcast_ref(),
-        app_config::WindowControlsSide::Right => widgets.dock.upcast_ref(),
+    let first: &gtk::Widget = match (show_window_controls, controls_side) {
+        (false, _) => widgets.dock.upcast_ref(),
+        (true, app_config::WindowControlsSide::Left) => widgets.close.upcast_ref(),
+        (true, app_config::WindowControlsSide::Right) => widgets.dock.upcast_ref(),
     };
     let parent: &gtk::Widget = toolbar.upcast_ref();
-    toolbar.first_child().as_ref() == Some(first)
-        && [
-            widgets.dock.upcast_ref::<gtk::Widget>(),
-            widgets.settings.upcast_ref(),
-            widgets.new_ws.upcast_ref(),
-            widgets.minimize.upcast_ref(),
+    if toolbar.first_child().as_ref() != Some(first) {
+        return false;
+    }
+    let base_parented = [
+        widgets.dock.upcast_ref::<gtk::Widget>(),
+        widgets.settings.upcast_ref(),
+        widgets.new_ws.upcast_ref(),
+    ]
+    .iter()
+    .all(|widget| widget.parent().as_ref() == Some(parent));
+    if !base_parented {
+        return false;
+    }
+    if show_window_controls {
+        [
+            widgets.minimize.upcast_ref::<gtk::Widget>(),
             widgets.maximize.upcast_ref(),
             widgets.close.upcast_ref(),
         ]
         .iter()
         .all(|widget| widget.parent().as_ref() == Some(parent))
+    } else {
+        [
+            widgets.minimize.upcast_ref::<gtk::Widget>(),
+            widgets.maximize.upcast_ref(),
+            widgets.close.upcast_ref(),
+        ]
+        .iter()
+        .all(|widget| widget.parent().is_none())
+    }
 }
 
 /// Classic layout: everything back in the top bar, controls at the chosen side.
-fn layout_top_bar_visible(w: &TopBarWidgets, controls_side: app_config::WindowControlsSide) {
+fn layout_top_bar_visible(
+    w: &TopBarWidgets,
+    controls_side: app_config::WindowControlsSide,
+    show_window_controls: bool,
+) {
     // dock | settings | new_ws | indicator_box | [controls at side]
     w.content.append(&w.dock);
     w.content.append(&w.settings);
     w.content.append(&w.new_ws);
     w.content.append(&w.indicator_scroll);
 
-    match controls_side {
-        app_config::WindowControlsSide::Left => {
-            w.close
-                .insert_before(&w.content, w.content.first_child().as_ref());
-            w.minimize.insert_after(&w.content, Some(&w.close));
-            w.maximize.insert_after(&w.content, Some(&w.minimize));
-        }
-        app_config::WindowControlsSide::Right => {
-            w.content.append(&w.minimize);
-            w.content.append(&w.maximize);
-            w.content.append(&w.close);
+    if !show_window_controls {
+        // Window controls stay detached (hidden); tiling WMs provide their own.
+    } else {
+        match controls_side {
+            app_config::WindowControlsSide::Left => {
+                w.close
+                    .insert_before(&w.content, w.content.first_child().as_ref());
+                w.minimize.insert_after(&w.content, Some(&w.close));
+                w.maximize.insert_after(&w.content, Some(&w.minimize));
+            }
+            app_config::WindowControlsSide::Right => {
+                w.content.append(&w.minimize);
+                w.content.append(&w.maximize);
+                w.content.append(&w.close);
+            }
         }
     }
 
@@ -4091,7 +4125,20 @@ fn layout_top_bar_visible(w: &TopBarWidgets, controls_side: app_config::WindowCo
 
 /// Top bar hidden, sidebar open: left group + expanding spacer + right group,
 /// so the window controls sit at one end and the app buttons at the other.
-fn layout_sidebar_header(w: &TopBarWidgets, controls_side: app_config::WindowControlsSide) {
+fn layout_sidebar_header(
+    w: &TopBarWidgets,
+    controls_side: app_config::WindowControlsSide,
+    show_window_controls: bool,
+) {
+    if !show_window_controls {
+        // Tiling WM mode: app buttons only, window controls stay detached.
+        w.sidebar_header.append(&w.dock);
+        w.sidebar_header.append(&w.settings);
+        w.sidebar_header.append(&w.new_ws);
+        w.sidebar_header_handle.set_visible(true);
+        w.sidebar_drag_area.set_visible(false);
+        return;
+    }
     let spacer = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .hexpand(true)
